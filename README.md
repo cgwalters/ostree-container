@@ -36,6 +36,14 @@ $ ostree-container build --repo=/path/to/repo --ref=exampleos/x86_64/stable --lo
 
 Another option is `--push quay.io/exampleos/exampleos:stable` which would push directly to a registry.  This would particularly be intended to be usable inside a fully unprivileged container, just mounting in the secrets necessary to push to the target registry.
 
+## Take an arbitrary container and convert it to be OSTree ready
+
+There's nothing conceptually stopping us from having tooling that takes
+an arbitrary container image and just makes it "ostree ready".  Or even
+just dyanamically accepting a container image that has a kernel client side.
+
+This *may* be in scope at some point in the future.
+
 ### ostree-containers and derivation
 
 For an ostree-based OS that is derived from Fedora, 
@@ -70,6 +78,7 @@ A project like rpm-ostree could hence support:
 ```
 $ rpm-ostree rebase quay.io/exampleos/exampleos:stable
 ```
+(Along with the usual `rpm-ostree upgrade` knowing to pull that container image)
 
 ### Integrating with future container deltas
 
