@@ -3,9 +3,8 @@
 use super::Result;
 
 use openat_ext::*;
-use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::write::GzEncoder;
 use gio::prelude::*;
-use std::{fs::File, io::Write};
 use phf::phf_map;
 use openssl::hash::{Hasher, MessageDigest};
 use std::path::Path;
@@ -20,6 +19,7 @@ const OCI_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 const OCI_LAYOUT_JSON: &str = r#"{"imageLayoutVersion":"1.0.0"}"#;
 const BLOBDIR: &str = "blobs/sha256";
+const TMPBLOB: &str = ".tmpblob";
 
 // We only need name+type
 const QUERYINFO_ATTRS: &str = "standard::name,standard::type";
@@ -44,6 +44,7 @@ struct OstreeRepoSource<'a, 'b> {
 }
 
 struct BlobWriter<'a> {
+    ocidir: &'a openat::Dir,
     compressed_hash: Hasher,
     uncompressed_hash: Hasher,
     compressor: GzEncoder<Vec<u8>>,
@@ -51,59 +52,112 @@ struct BlobWriter<'a> {
     size: u64,
 }
 
+impl<'a> BlobWriter<'a> {
+    fn new(ocidir: &'a openat::Dir) -> Result<Self> {
+        Ok(Self {
+            ocidir,
+            compressed_hash: Hasher::new(MessageDigest::sha256())?,
+            uncompressed_hash: Hasher::new(MessageDigest::sha256())?,
+            compressor: GzEncoder::new(Vec::with_capacity(8192), flate2::Compression::default()),
+            // FIXME add ability to choose filename after completion
+            target: ocidir.new_file_writer(TMPBLOB, 0o644)?,
+            size: 0,
+        })
+    }
+
+    fn complete(mut self) -> Result<Blob> {
+        self.target.complete()?;
+        let compressed_sha256 = hex::encode(self.compressed_hash.finish()?);
+        let uncompressed_sha256 = hex::encode(self.uncompressed_hash.finish()?);
+        self.ocidir.local_rename(TMPBLOB, &format!("{}/{}", BLOBDIR, uncompressed_sha256))?;
+        Ok(Blob{
+            compressed_sha256,
+            uncompressed_sha256,
+            size: self.size,
+        })
+    }
+}
+
 impl<'a> std::io::Write for BlobWriter<'a> {
     fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
         self.uncompressed_hash.update(srcbuf)?;
         self.compressor.get_mut().clear();
-        let n = self.compressor.write(srcbuf)?;
+        self.compressor.write_all(srcbuf)?;
         let compressed_buf = self.compressor.get_mut().as_slice();
-        assert_eq!(n, compressed_buf.len());
         self.compressed_hash.update(compressed_buf)?;
         self.target.writer.write_all(compressed_buf)?;
-        self.size += n as u64;
+        self.size += compressed_buf.len() as u64;
         Ok(compressed_buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        todo!()
+        Ok(())
     }
 }
 
 fn write_ostree<W: std::io::Write>(root: &ostree::RepoFile, out: &mut tar::Builder<W>) -> Result<()> {
-    todo!()
+    Ok(())
 }
 
 fn export_ostree_ref_to_blobdir(repo: &OstreeRepoSource, root: &ostree::RepoFile, ocidir: &openat::Dir) -> Result<Blob> {
-    let tmpblob = ".tmpblob";
-    let mut w = BlobWriter {
-        compressed_hash: Hasher::new(MessageDigest::sha256())?,
-        uncompressed_hash: Hasher::new(MessageDigest::sha256())?,
-        compressor: GzEncoder::new(Vec::with_capacity(8192), flate2::Compression::default()),
-        // FIXME add ability to choose filename after completion
-        target: ocidir.new_file_writer(tmpblob, 0o644)?,
-        size: 0,
-    };
+    let mut w = BlobWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
         write_ostree(root, &mut tar)?;
     }
-    w.target.complete()?;
-    let compressed_sha256 = hex::encode(w.compressed_hash.finish()?);
-    let uncompressed_sha256 = hex::encode(w.uncompressed_hash.finish()?);
-    ocidir.local_rename(tmpblob, &uncompressed_sha256)?;
-    Ok(Blob{
-        compressed_sha256,
-        uncompressed_sha256,
-        size: w.size,
-    })
+    w.complete()
+}
+
+fn write_json_blob<S: serde::Serialize>(ocidir: &openat::Dir, v: &S) -> Result<Blob> {
+    let mut w = BlobWriter::new(ocidir)?;
+    {
+        cjson::to_writer(&mut w, v)
+            .map_err(|e| format!("{:?}", e))?;
+    }
+    w.complete()
 }
 
 fn build_oci(repo: &OstreeRepoSource, root: &ostree::RepoFile, ocidir: &Path) -> Result<()> {
-    std::fs::create_dir_all(ocidir.join("blobs/sha256"))?;
+    // Explicitly error if the target exists
+    std::fs::create_dir(ocidir)?;
     let ocidir = &openat::Dir::open(ocidir)?;
+    ocidir.ensure_dir_all(BLOBDIR, 0o755)?;
     ocidir.write_file_contents("oci-layout", 0o644, OCI_LAYOUT_JSON)?;
 
-    let blob = export_ostree_ref_to_blobdir(repo, root, ocidir)?;
+    let rootfs_blob = export_ostree_ref_to_blobdir(repo, root, ocidir)?;
+    let root_id = format!("sha256:{}", rootfs_blob.uncompressed_sha256);
+
+    let config = serde_json::json!({
+        "created": "today", 
+        "architecture": "x86_64", 
+        "os": "linux",
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": [root_id],
+        },
+        "history": [
+            {
+                "created": "today",
+                "commit": "created by ostree-container",
+            }
+        ]
+    });
+    let config_blob = write_json_blob(ocidir, &config)?;
+
+    // let manifest_data = serde_json::json!({
+    //     "schemaVersion": 2,
+    //     "config": {
+    //         "mediaType": "application/vnd.oci.image.config.v1+json",
+    //         "size": config_blob.size,
+    //         "digest': 'sha256:' + config_blob.sha256,
+    //     },
+    //     "layers": [
+    //         { 'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip',
+    //           'size': baselayer_blob.size,
+    //           'digest': 'sha256:' + baselayer_blob.sha256,
+    //         }
+    //     ],
+    // });
 
     todo!()
 }
