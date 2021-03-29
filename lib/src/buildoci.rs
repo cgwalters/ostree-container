@@ -3,6 +3,7 @@
 use super::Result;
 
 use anyhow::{anyhow, Context};
+use camino::Utf8Path;
 use flate2::write::GzEncoder;
 use fn_error_context::context;
 use gio::prelude::*;
@@ -10,8 +11,8 @@ use openat_ext::*;
 use openssl::hash::{Hasher, MessageDigest};
 use ostree::prelude::*;
 use phf::phf_map;
-use std::io::prelude::*;
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
+use std::{convert::TryFrom, io::prelude::*};
 
 /// Map the value from `uname -m` to the Go architecture.
 /// TODO find a more canonical home for this.
@@ -162,17 +163,26 @@ fn gio_filetype_to_tar(t: gio::FileType) -> tar::EntryType {
     }
 }
 
+fn map_path(p: &Utf8Path) -> std::borrow::Cow<Utf8Path> {
+    match p.strip_prefix("./usr/etc") {
+        Ok(r) => Cow::Owned(Utf8Path::new("./etc").join(r)),
+        _ => Cow::Borrowed(p),
+    }
+}
+
 fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     repo: &ostree::Repo,
-    dirpath: &Path,
+    dirpath: &Utf8Path,
     f: &gio::File,
     out: &mut tar::Builder<W>,
     cancellable: Option<&C>,
 ) -> Result<()> {
     let mut h = tar::Header::new_gnu();
     let i = f.query_info(DEFAULT_QUERYINFO_ATTRS, QUERYINFO_FLAGS, cancellable)?;
-    let name = &i.get_name().unwrap_or_else(|| ".".into());
+    let name = camino::Utf8PathBuf::try_from(i.get_name().unwrap_or_else(|| ".".into()))?;
     let path = &dirpath.join(name);
+    let path = map_path(&path);
+    let path = &*path;
     let t = i.get_file_type();
     h.set_entry_type(gio_filetype_to_tar(t));
     h.set_uid(i.get_attribute_uint32("unix::uid") as u64);
@@ -215,7 +225,7 @@ fn export_ostree_ref_to_blobdir(
     let mut w = LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
-        let path = Path::new("");
+        let path = Utf8Path::new("");
         ostree_to_tar(repo, path, root, &mut tar, gio::NONE_CANCELLABLE)?;
         tar.finish()?;
     }
@@ -312,4 +322,18 @@ pub fn build<R: AsRef<Path>, S: AsRef<str>>(repo: R, ostree_ref: S, target: Targ
     let repo = &ostree::Repo::new_for_path(repo_path);
     repo.open(cancellable)?;
     build_impl(repo, ostree_ref.as_ref(), target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_path() {
+        assert_eq!(map_path("/".into()), Utf8Path::new("/"));
+        assert_eq!(
+            map_path("./usr/etc/blah".into()),
+            Utf8Path::new("./etc/blah")
+        );
+    }
 }

@@ -29,10 +29,17 @@ These generated containers should work in 3 distinct ways:
 Given an OSTree repository, running *outside* a container:
 
 ```
-$ ostree-container build --repo=/path/to/repo --ref=exampleos/x86_64/stable --local-image=localhost/exampleos:stable
+$ ostree-container build --repo=/path/to/repo --ref=exampleos/x86_64/stable --oci-dir=/output/exampleos
 ```
 
-`--local-image` will write to the `podman` container storage.
+`--oci-dir` creates an [OpenContainers image](https://github.com/opencontainers/image-spec/blob/master/spec.md) layout.
+
+You can then e.g.
+
+```
+$ skopeo copy oci:/output/exampleos containers-storage:localhost/exampleos
+$ podman run --rm -ti --entrypoint bash localhost/exampleos
+```
 
 Another option is `--push quay.io/exampleos/exampleos:stable` which would push directly to a registry.  This would particularly be intended to be usable inside a fully unprivileged container, just mounting in the secrets necessary to push to the target registry.
 

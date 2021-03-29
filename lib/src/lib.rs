@@ -12,5 +12,5 @@
 /// to a string to output to a terminal or logs.
 type Result<T> = anyhow::Result<T>;
 
-pub mod build;
+pub mod buildoci;
 pub mod client;

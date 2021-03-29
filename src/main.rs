@@ -23,10 +23,10 @@ enum Opt {
 
 fn build(opts: &BuildOpts) -> Result<()> {
     let path = Path::new(&opts.oci_dir);
-    Ok(ostree_container::build::build(
+    Ok(ostree_container::buildoci::build(
         &opts.repo,
         &opts.ostree_ref,
-        ostree_container::build::Target::OciDir(path),
+        ostree_container::buildoci::Target::OciDir(path),
     )?)
 }
 
