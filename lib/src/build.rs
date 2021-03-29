@@ -3,12 +3,13 @@
 use super::Result;
 
 use anyhow::{anyhow, Context};
-use fn_error_context::context;
 use flate2::write::GzEncoder;
+use fn_error_context::context;
 use gio::prelude::*;
 use openat_ext::*;
 use openssl::hash::{Hasher, MessageDigest};
 use phf::phf_map;
+use std::io::prelude::*;
 use std::path::Path;
 
 static OSTREE_ARCH_TO_OCI: phf::Map<&str, &str> = phf_map! {
@@ -96,12 +97,19 @@ impl<'a> BlobWriter<'a> {
 
     #[context("Completing blob")]
     fn complete(mut self) -> Result<Blob> {
+        let compression = self.compression.take();
+        let uncompressed_sha256 = if let Some(mut c) = compression {
+            c.compressor.get_mut().clear();
+            let buf = c.compressor.finish()?;
+            self.hash.update(&buf)?;
+            self.target.as_mut().unwrap().writer.write_all(&buf)?;
+            self.size += buf.len() as u64;
+            Some(hex::encode(c.uncompressed_hash.finish()?))
+        } else {
+            None
+        };
         self.target.take().unwrap().complete()?;
         let sha256 = hex::encode(self.hash.finish()?);
-        let uncompressed_sha256 =  
-            self.compression.as_mut().map(|c| {
-                c.uncompressed_hash.finish().map(hex::encode)
-            }).transpose()?;
         self.ocidir
             .local_rename(TMPBLOB, &format!("{}/{}", BLOBDIR, sha256))?;
         Ok(Blob {
@@ -114,17 +122,20 @@ impl<'a> BlobWriter<'a> {
 
 impl<'a> std::io::Write for BlobWriter<'a> {
     fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
-        self.hash.update(srcbuf)?;
         if let Some(c) = self.compression.as_mut() {
             c.compressor.get_mut().clear();
             c.compressor.write_all(srcbuf).unwrap();
             let compressed_buf = c.compressor.get_mut().as_slice();
             self.hash.update(compressed_buf)?;
-            self.target.as_mut().unwrap().writer.write_all(compressed_buf).unwrap();
+            self.target
+                .as_mut()
+                .unwrap()
+                .writer
+                .write_all(compressed_buf)?;
             self.size += compressed_buf.len() as u64;
         } else {
             self.hash.update(srcbuf)?;
-            self.target.as_mut().unwrap().writer.write_all(srcbuf).unwrap();
+            self.target.as_mut().unwrap().writer.write_all(srcbuf)?;
             self.size += srcbuf.len() as u64;
         }
         Ok(srcbuf.len())
@@ -144,9 +155,10 @@ fn write_ostree<W: std::io::Write>(
     header.set_path("foo")?;
     header.set_size(4);
     header.set_cksum();
-    
+
     let data: &[u8] = &[1, 2, 3, 4];
     out.append(&header, data).context("appending tar")?;
+    out.finish()?;
     Ok(())
 }
 
@@ -183,19 +195,20 @@ fn build_oci(repo: &OstreeRepoSource, root: &ostree::RepoFile, ocidir: &Path) ->
     ocidir.write_file_contents("oci-layout", 0o644, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
 
     let rootfs_blob = export_ostree_ref_to_blobdir(repo, root, ocidir)?;
-    let root_layer_id = format!("sha256:{}", rootfs_blob.uncompressed_sha256.as_deref().unwrap());
+    let root_layer_id = format!(
+        "sha256:{}",
+        rootfs_blob.uncompressed_sha256.as_deref().unwrap()
+    );
 
     let config = serde_json::json!({
-        "created": "today",
         "architecture": arch,
         "os": "linux",
         "rootfs": {
             "type": "layers",
-            "diff_ids": root_layer_id,
+            "diff_ids": [ root_layer_id ],
         },
         "history": [
             {
-                "created": "today",
                 "commit": "created by ostree-container",
             }
         ]
