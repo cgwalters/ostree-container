@@ -36,7 +36,6 @@ pub enum Target<'a> {
 
 struct Blob {
     sha256: String,
-    uncompressed_sha256: Option<String>,
     size: u64,
 }
 
@@ -46,22 +45,28 @@ impl Blob {
     }
 }
 
+struct Layer {
+    blob: Blob,
+    uncompressed_sha256: String,
+}
+
 struct OstreeRepoSource<'a, 'b> {
     path: &'a Path,
     repo: &'b ostree::Repo,
 }
 
-struct BlobCompression {
-    uncompressed_hash: Hasher,
-    compressor: GzEncoder<Vec<u8>>,
-}
 
 struct BlobWriter<'a> {
     ocidir: &'a openat::Dir,
     hash: Hasher,
-    compression: Option<BlobCompression>,
     target: Option<FileWriter<'a>>,
     size: u64,
+}
+
+struct LayerWriter<'a> {
+    bw: BlobWriter<'a>,
+    uncompressed_hash: Hasher,
+    compressor: GzEncoder<Vec<u8>>,
 }
 
 impl<'a> Drop for BlobWriter<'a> {
@@ -79,42 +84,20 @@ impl<'a> BlobWriter<'a> {
         Ok(Self {
             ocidir,
             hash: Hasher::new(MessageDigest::sha256())?,
-            compression: None,
             // FIXME add ability to choose filename after completion
             target: Some(ocidir.new_file_writer(TMPBLOB, 0o644)?),
             size: 0,
         })
     }
 
-    fn new_gzip(ocidir: &'a openat::Dir) -> Result<Self> {
-        let mut s = Self::new(ocidir)?;
-        s.compression = Some(BlobCompression {
-            uncompressed_hash: Hasher::new(MessageDigest::sha256())?,
-            compressor: GzEncoder::new(Vec::with_capacity(8192), flate2::Compression::default()),
-        });
-        Ok(s)
-    }
-
     #[context("Completing blob")]
     fn complete(mut self) -> Result<Blob> {
-        let compression = self.compression.take();
-        let uncompressed_sha256 = if let Some(mut c) = compression {
-            c.compressor.get_mut().clear();
-            let buf = c.compressor.finish()?;
-            self.hash.update(&buf)?;
-            self.target.as_mut().unwrap().writer.write_all(&buf)?;
-            self.size += buf.len() as u64;
-            Some(hex::encode(c.uncompressed_hash.finish()?))
-        } else {
-            None
-        };
         self.target.take().unwrap().complete()?;
         let sha256 = hex::encode(self.hash.finish()?);
         self.ocidir
             .local_rename(TMPBLOB, &format!("{}/{}", BLOBDIR, sha256))?;
         Ok(Blob {
             sha256,
-            uncompressed_sha256,
             size: self.size,
         })
     }
@@ -122,22 +105,47 @@ impl<'a> BlobWriter<'a> {
 
 impl<'a> std::io::Write for BlobWriter<'a> {
     fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
-        if let Some(c) = self.compression.as_mut() {
-            c.compressor.get_mut().clear();
-            c.compressor.write_all(srcbuf).unwrap();
-            let compressed_buf = c.compressor.get_mut().as_slice();
-            self.hash.update(compressed_buf)?;
-            self.target
-                .as_mut()
-                .unwrap()
-                .writer
-                .write_all(compressed_buf)?;
-            self.size += compressed_buf.len() as u64;
-        } else {
-            self.hash.update(srcbuf)?;
-            self.target.as_mut().unwrap().writer.write_all(srcbuf)?;
-            self.size += srcbuf.len() as u64;
-        }
+        self.hash.update(srcbuf)?;
+        self.target.as_mut().unwrap().writer.write_all(srcbuf)?;
+        self.size += srcbuf.len() as u64;
+        Ok(srcbuf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> LayerWriter<'a> {
+    fn new(ocidir: &'a openat::Dir) -> Result<Self> {
+        let bw = BlobWriter::new(ocidir)?;
+        Ok(Self {
+            bw,
+            uncompressed_hash: Hasher::new(MessageDigest::sha256())?,
+            compressor: GzEncoder::new(Vec::with_capacity(8192), flate2::Compression::default()),
+        })
+    }
+
+    #[context("Completing layer")]
+    fn complete(mut self) -> Result<Layer> {
+        self.compressor.get_mut().clear();
+        let buf = self.compressor.finish()?;
+        self.bw.write_all(&buf)?;
+        let blob = self.bw.complete()?;
+        let uncompressed_sha256 = hex::encode(self.uncompressed_hash.finish()?);
+        Ok(Layer {
+            blob,
+            uncompressed_sha256,
+        })
+    }
+}
+
+impl<'a> std::io::Write for LayerWriter<'a> {
+    fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
+        self.compressor.get_mut().clear();
+        self.compressor.write_all(srcbuf).unwrap();
+        let compressed_buf = self.compressor.get_mut().as_slice();
+        self.bw.write_all(&compressed_buf)?;
         Ok(srcbuf.len())
     }
 
@@ -167,8 +175,8 @@ fn export_ostree_ref_to_blobdir(
     repo: &OstreeRepoSource,
     root: &ostree::RepoFile,
     ocidir: &openat::Dir,
-) -> Result<Blob> {
-    let mut w = BlobWriter::new_gzip(ocidir)?;
+) -> Result<Layer> {
+    let mut w = LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
         write_ostree(root, &mut tar)?;
@@ -197,7 +205,7 @@ fn build_oci(repo: &OstreeRepoSource, root: &ostree::RepoFile, ocidir: &Path) ->
     let rootfs_blob = export_ostree_ref_to_blobdir(repo, root, ocidir)?;
     let root_layer_id = format!(
         "sha256:{}",
-        rootfs_blob.uncompressed_sha256.as_deref().unwrap()
+        rootfs_blob.uncompressed_sha256
     );
 
     let config = serde_json::json!({
@@ -224,8 +232,8 @@ fn build_oci(repo: &OstreeRepoSource, root: &ostree::RepoFile, ocidir: &Path) ->
         },
         "layers": [
             { "mediaType": OCI_TYPE_LAYER,
-              "size": rootfs_blob.size,
-              "digest":  rootfs_blob.digest_id(),
+              "size": rootfs_blob.blob.size,
+              "digest":  rootfs_blob.blob.digest_id(),
             }
         ],
     });
