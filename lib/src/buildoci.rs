@@ -21,10 +21,13 @@ static MACHINE_TO_OCI: phf::Map<&str, &str> = phf_map! {
     "aarch64" => "arm64",
 };
 
+// OCI types, see https://github.com/opencontainers/image-spec/blob/master/media-types.md
 const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
 const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+/// Path inside an OCI directory to the blobs
 const BLOBDIR: &str = "blobs/sha256";
+// FIXME get rid of this after updating to https://github.com/coreos/openat-ext/pull/27
 const TMPBLOB: &str = ".tmpblob";
 
 // We only need name+type when iterating
@@ -40,6 +43,7 @@ pub enum Target<'a> {
     OciDir(&'a Path),
 }
 
+/// Completed blob metadata
 struct Blob {
     sha256: String,
     size: u64,
@@ -51,11 +55,13 @@ impl Blob {
     }
 }
 
+/// Completed layer metadata
 struct Layer {
     blob: Blob,
     uncompressed_sha256: String,
 }
 
+/// Create an OCI blob.
 struct BlobWriter<'a> {
     ocidir: &'a openat::Dir,
     hash: Hasher,
@@ -63,6 +69,7 @@ struct BlobWriter<'a> {
     size: u64,
 }
 
+/// Create an OCI layer (also a blob).
 struct LayerWriter<'a> {
     bw: BlobWriter<'a>,
     uncompressed_hash: Hasher,
@@ -154,6 +161,7 @@ impl<'a> std::io::Write for LayerWriter<'a> {
     }
 }
 
+/// Map GLib file types to Rust `tar` types
 fn gio_filetype_to_tar(t: gio::FileType) -> tar::EntryType {
     match t {
         gio::FileType::Regular => tar::EntryType::Regular,
@@ -163,6 +171,7 @@ fn gio_filetype_to_tar(t: gio::FileType) -> tar::EntryType {
     }
 }
 
+/// Convert /usr/etc back to /etc
 fn map_path(p: &Utf8Path) -> std::borrow::Cow<Utf8Path> {
     match p.strip_prefix("./usr/etc") {
         Ok(r) => Cow::Owned(Utf8Path::new("./etc").join(r)),
@@ -170,6 +179,7 @@ fn map_path(p: &Utf8Path) -> std::borrow::Cow<Utf8Path> {
     }
 }
 
+/// Recursively walk an OSTree directory, generating a tarball
 fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     repo: &ostree::Repo,
     dirpath: &Utf8Path,
@@ -216,6 +226,7 @@ fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     Ok(())
 }
 
+/// Write an ostree directory as an OCI blob
 #[context("Writing ostree root to blob")]
 fn export_ostree_ref_to_blobdir(
     repo: &ostree::Repo,
@@ -232,6 +243,7 @@ fn export_ostree_ref_to_blobdir(
     w.complete()
 }
 
+/// Write a serializable data (JSON) as an OCI blob
 #[context("Writing json blob")]
 fn write_json_blob<S: serde::Serialize>(ocidir: &openat::Dir, v: &S) -> Result<Blob> {
     let mut w = BlobWriter::new(ocidir)?;
@@ -241,6 +253,7 @@ fn write_json_blob<S: serde::Serialize>(ocidir: &openat::Dir, v: &S) -> Result<B
     w.complete()
 }
 
+/// Generate an OCI image from a given ostree root
 #[context("Building oci")]
 fn build_oci(repo: &ostree::Repo, root: &gio::File, ocidir: &Path) -> Result<()> {
     let utsname = nix::sys::utsname::uname();
@@ -307,6 +320,7 @@ fn build_oci(repo: &ostree::Repo, root: &gio::File, ocidir: &Path) -> Result<()>
     Ok(())
 }
 
+/// Helper for `build()` that avoids generics
 fn build_impl(repo: &ostree::Repo, ostree_ref: &str, target: Target) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
     let (root, _) = repo.read_commit(ostree_ref, cancellable)?;
