@@ -7,11 +7,13 @@ use camino::Utf8Path;
 use flate2::write::GzEncoder;
 use fn_error_context::context;
 use gio::prelude::*;
+use gvariant::aligned_bytes::TryAsAligned;
+use gvariant::{gv, Marker, Structure};
 use openat_ext::*;
 use openssl::hash::{Hasher, MessageDigest};
 use ostree::prelude::*;
 use phf::phf_map;
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, collections::HashSet, path::Path};
 use std::{convert::TryFrom, io::prelude::*};
 
 /// Map the value from `uname -m` to the Go architecture.
@@ -180,7 +182,7 @@ fn map_path(p: &Utf8Path) -> std::borrow::Cow<Utf8Path> {
 }
 
 /// Recursively walk an OSTree directory, generating a tarball
-fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
+fn ostree_content_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     repo: &ostree::Repo,
     dirpath: &Utf8Path,
     f: &gio::File,
@@ -205,7 +207,7 @@ fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
             let it = f.enumerate_children(BASIC_QUERYINFO_ATTRS, QUERYINFO_FLAGS, cancellable)?;
             while let Some(child_info) = it.next_file(cancellable)? {
                 let child = &it.get_child(&child_info).expect("file");
-                ostree_to_tar(repo, path, child, out, cancellable)?;
+                ostree_content_to_tar(repo, path, child, out, cancellable)?;
             }
         }
         gio::FileType::SymbolicLink => {
@@ -226,18 +228,138 @@ fn ostree_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     Ok(())
 }
 
+struct OstreeMetadataWriter<'a, W: std::io::Write> {
+    out: &'a mut tar::Builder<W>,
+    wrote_dirtree: HashSet<String>,
+    wrote_dirmeta: HashSet<String>,
+}
+
+impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
+    fn append(
+        &mut self,
+        objtype: ostree::ObjectType,
+        checksum: &str,
+        v: &glib::Variant,
+    ) -> Result<()> {
+        match objtype {
+            ostree::ObjectType::Commit => {}
+            ostree::ObjectType::DirTree => {
+                if self.wrote_dirtree.contains(checksum) {
+                    return Ok(());
+                }
+                let was_present = self.wrote_dirtree.insert(checksum.to_string());
+                debug_assert!(!was_present);
+            }
+            ostree::ObjectType::DirMeta => {
+                if self.wrote_dirmeta.contains(checksum) {
+                    return Ok(());
+                }
+                let was_present = self.wrote_dirmeta.insert(checksum.to_string());
+                debug_assert!(!was_present);
+            }
+            o => panic!("Unexpected object type: {:?}", o),
+        }
+        let mut h = tar::Header::new_gnu();
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mode(0o644);
+        let (first, rest) = checksum.split_at(2);
+        let path = format!("./ostree/repo/objects/{}/{}", first, rest);
+        let data = v.get_data_as_bytes();
+        let data = data.as_ref();
+        h.set_size(data.len() as u64);
+        self.out.append_data(&mut h, &path, data)?;
+        Ok(())
+    }
+
+    fn append_dirtree<C: IsA<gio::Cancellable>>(
+        &mut self,
+        repo: &ostree::Repo,
+        checksum: &str,
+        cancellable: Option<&C>,
+    ) -> Result<()> {
+        let v = &repo.load_variant(ostree::ObjectType::DirTree, checksum)?;
+        self.append(ostree::ObjectType::DirMeta, checksum, v)?;
+        let v = v.get_data_as_bytes();
+        let v = v.try_as_aligned()?;
+        let v = gv!("(a(say)a(sayay))").cast(v);
+        let (_, dirs) = v.to_tuple();
+
+        if let Some(c) = cancellable {
+            c.set_error_if_cancelled()?;
+        }
+
+        let mut hexbuf = [0u8; 64];
+        for item in dirs {
+            let (_, contents_csum, meta_csum) = item.to_tuple();
+            {
+                hex::encode_to_slice(meta_csum, &mut hexbuf)?;
+                let meta_csum = std::str::from_utf8(&hexbuf)?;
+                let meta_v = &repo.load_variant(ostree::ObjectType::DirMeta, meta_csum)?;
+                self.append(ostree::ObjectType::DirMeta, meta_csum, meta_v)?;
+            }
+            hex::encode_to_slice(contents_csum, &mut hexbuf)?;
+            let dirtree_csum = std::str::from_utf8(&hexbuf)?;
+            self.append_dirtree(repo, dirtree_csum, cancellable)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Recursively walk an OSTree commit, injecting all of its metadata
+/// into the
+fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
+    repo: &ostree::Repo,
+    commit_checksum: &str,
+    out: &mut tar::Builder<W>,
+    cancellable: Option<&C>,
+) -> Result<()> {
+    // Pre create the object directories
+    for d in 0..0xFF {
+        let mut h = tar::Header::new_gnu();
+        h.set_uid(0);
+        h.set_gid(0);
+        let path = format!("./ostree/repo/objects/{:#04x}", d);
+        out.append_data(&mut h, &path, &mut std::io::empty())?;
+    }
+
+    let writer = &mut OstreeMetadataWriter {
+        out,
+        wrote_dirmeta: HashSet::new(),
+        wrote_dirtree: HashSet::new(),
+    };
+    let (commit_v, _) = repo.load_commit(commit_checksum)?;
+    let commit_v = &commit_v;
+    writer.append(ostree::ObjectType::Commit, commit_checksum, commit_v)?;
+    let commit_v = commit_v.get_data_as_bytes();
+    let commit_v = commit_v.try_as_aligned()?;
+    let commit = gv!("(a{sv}aya(say)sstayay)").cast(commit_v);
+    let commit = commit.to_tuple();
+    let contents = &hex::encode(commit.6);
+    let metadata_checksum = &hex::encode(commit.7);
+    let metadata_v = &repo.load_variant(ostree::ObjectType::DirMeta, metadata_checksum)?;
+    writer.append(ostree::ObjectType::DirMeta, metadata_checksum, metadata_v)?;
+
+    writer.append_dirtree(repo, contents, cancellable)?;
+    Ok(())
+}
+
 /// Write an ostree directory as an OCI blob
 #[context("Writing ostree root to blob")]
 fn export_ostree_ref_to_blobdir(
     repo: &ostree::Repo,
     root: &gio::File,
+    ostree_commit: &str,
     ocidir: &openat::Dir,
 ) -> Result<Layer> {
+    let cancellable = gio::NONE_CANCELLABLE;
     let mut w = LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
         let path = Utf8Path::new("");
-        ostree_to_tar(repo, path, root, &mut tar, gio::NONE_CANCELLABLE)?;
+        ostree_metadata_to_tar(repo, ostree_commit, &mut tar, cancellable)?;
+        ostree_content_to_tar(repo, path, root, &mut tar, cancellable)?;
         tar.finish()?;
     }
     w.complete()
@@ -255,7 +377,7 @@ fn write_json_blob<S: serde::Serialize>(ocidir: &openat::Dir, v: &S) -> Result<B
 
 /// Generate an OCI image from a given ostree root
 #[context("Building oci")]
-fn build_oci(repo: &ostree::Repo, root: &gio::File, ocidir: &Path) -> Result<()> {
+fn build_oci(repo: &ostree::Repo, root: &gio::File, commit: &str, ocidir: &Path) -> Result<()> {
     let utsname = nix::sys::utsname::uname();
     let arch = MACHINE_TO_OCI[utsname.machine()];
     // Explicitly error if the target exists
@@ -264,7 +386,7 @@ fn build_oci(repo: &ostree::Repo, root: &gio::File, ocidir: &Path) -> Result<()>
     ocidir.ensure_dir_all(BLOBDIR, 0o755)?;
     ocidir.write_file_contents("oci-layout", 0o644, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
 
-    let rootfs_blob = export_ostree_ref_to_blobdir(repo, root, ocidir)?;
+    let rootfs_blob = export_ostree_ref_to_blobdir(repo, root, commit, ocidir)?;
     let root_layer_id = format!("sha256:{}", rootfs_blob.uncompressed_sha256);
 
     let config = serde_json::json!({
@@ -323,9 +445,9 @@ fn build_oci(repo: &ostree::Repo, root: &gio::File, ocidir: &Path) -> Result<()>
 /// Helper for `build()` that avoids generics
 fn build_impl(repo: &ostree::Repo, ostree_ref: &str, target: Target) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
-    let (root, _) = repo.read_commit(ostree_ref, cancellable)?;
+    let (root, rev) = repo.read_commit(ostree_ref, cancellable)?;
     match target {
-        Target::OciDir(d) => return build_oci(repo, &root, d),
+        Target::OciDir(d) => return build_oci(repo, &root, rev.as_str(), d),
     }
 }
 

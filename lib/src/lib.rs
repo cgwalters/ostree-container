@@ -3,10 +3,10 @@
 //! This crate contains APIs to bidirectionally map
 //! between OSTree repositories and container images.
 
-#![deny(unused_results)]
 #![deny(missing_docs)]
-// We're just a wrapper around openat, shouldn't have any unsafe here.
-#![forbid(unsafe_code)]
+// Good defaults
+#![deny(unused_results)]
+#![deny(unsafe_code)]
 
 /// Our generic catchall fatal error, expected to be converted
 /// to a string to output to a terminal or logs.
