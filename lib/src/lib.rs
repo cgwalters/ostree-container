@@ -15,4 +15,5 @@ type Result<T> = anyhow::Result<T>;
 pub mod buildoci;
 pub mod client;
 
+mod oci;
 mod ostree_ext;

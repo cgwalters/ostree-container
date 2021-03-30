@@ -2,35 +2,16 @@
 
 use super::Result;
 
+use crate::oci;
 use crate::ostree_ext::*;
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use camino::Utf8Path;
-use flate2::write::GzEncoder;
 use fn_error_context::context;
 use gio::prelude::*;
 use gvariant::aligned_bytes::TryAsAligned;
 use gvariant::{gv, Marker, Structure};
-use openat_ext::*;
-use openssl::hash::{Hasher, MessageDigest};
-use phf::phf_map;
-use std::io::prelude::*;
+
 use std::{borrow::Cow, collections::HashSet, path::Path};
-
-/// Map the value from `uname -m` to the Go architecture.
-/// TODO find a more canonical home for this.
-static MACHINE_TO_OCI: phf::Map<&str, &str> = phf_map! {
-    "x86_64" => "amd64",
-    "aarch64" => "arm64",
-};
-
-// OCI types, see https://github.com/opencontainers/image-spec/blob/master/media-types.md
-const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
-const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
-const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
-/// Path inside an OCI directory to the blobs
-const BLOBDIR: &str = "blobs/sha256";
-// FIXME get rid of this after updating to https://github.com/coreos/openat-ext/pull/27
-const TMPBLOB: &str = ".tmpblob";
 
 // This way the default ostree -> sysroot/ostree symlink works.
 const OSTREEDIR: &str = "./sysroot/ostree";
@@ -39,124 +20,6 @@ const OSTREEDIR: &str = "./sysroot/ostree";
 pub enum Target<'a> {
     /// Generate an Open Containers image directory layout
     OciDir(&'a Path),
-}
-
-/// Completed blob metadata
-struct Blob {
-    sha256: String,
-    size: u64,
-}
-
-impl Blob {
-    fn digest_id(&self) -> String {
-        format!("sha256:{}", self.sha256)
-    }
-}
-
-/// Completed layer metadata
-struct Layer {
-    blob: Blob,
-    uncompressed_sha256: String,
-}
-
-/// Create an OCI blob.
-struct BlobWriter<'a> {
-    ocidir: &'a openat::Dir,
-    hash: Hasher,
-    target: Option<FileWriter<'a>>,
-    size: u64,
-}
-
-/// Create an OCI layer (also a blob).
-struct LayerWriter<'a> {
-    bw: BlobWriter<'a>,
-    uncompressed_hash: Hasher,
-    compressor: GzEncoder<Vec<u8>>,
-}
-
-impl<'a> Drop for BlobWriter<'a> {
-    fn drop(&mut self) {
-        if let Some(t) = self.target.take() {
-            // Defuse
-            let _ = t.abandon();
-        }
-    }
-}
-
-impl<'a> BlobWriter<'a> {
-    #[context("Creating blob writer")]
-    fn new(ocidir: &'a openat::Dir) -> Result<Self> {
-        Ok(Self {
-            ocidir,
-            hash: Hasher::new(MessageDigest::sha256())?,
-            // FIXME add ability to choose filename after completion
-            target: Some(ocidir.new_file_writer(TMPBLOB, 0o644)?),
-            size: 0,
-        })
-    }
-
-    #[context("Completing blob")]
-    fn complete(mut self) -> Result<Blob> {
-        self.target.take().unwrap().complete()?;
-        let sha256 = hex::encode(self.hash.finish()?);
-        self.ocidir
-            .local_rename(TMPBLOB, &format!("{}/{}", BLOBDIR, sha256))?;
-        Ok(Blob {
-            sha256,
-            size: self.size,
-        })
-    }
-}
-
-impl<'a> std::io::Write for BlobWriter<'a> {
-    fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
-        self.hash.update(srcbuf)?;
-        self.target.as_mut().unwrap().writer.write_all(srcbuf)?;
-        self.size += srcbuf.len() as u64;
-        Ok(srcbuf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> LayerWriter<'a> {
-    fn new(ocidir: &'a openat::Dir) -> Result<Self> {
-        let bw = BlobWriter::new(ocidir)?;
-        Ok(Self {
-            bw,
-            uncompressed_hash: Hasher::new(MessageDigest::sha256())?,
-            compressor: GzEncoder::new(Vec::with_capacity(8192), flate2::Compression::default()),
-        })
-    }
-
-    #[context("Completing layer")]
-    fn complete(mut self) -> Result<Layer> {
-        self.compressor.get_mut().clear();
-        let buf = self.compressor.finish()?;
-        self.bw.write_all(&buf)?;
-        let blob = self.bw.complete()?;
-        let uncompressed_sha256 = hex::encode(self.uncompressed_hash.finish()?);
-        Ok(Layer {
-            blob,
-            uncompressed_sha256,
-        })
-    }
-}
-
-impl<'a> std::io::Write for LayerWriter<'a> {
-    fn write(&mut self, srcbuf: &[u8]) -> std::io::Result<usize> {
-        self.compressor.get_mut().clear();
-        self.compressor.write_all(srcbuf).unwrap();
-        let compressed_buf = self.compressor.get_mut().as_slice();
-        self.bw.write_all(&compressed_buf)?;
-        Ok(srcbuf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Convert /usr/etc back to /etc
@@ -361,9 +224,9 @@ fn export_ostree_ref_to_blobdir(
     repo: &ostree::Repo,
     ostree_commit: &str,
     ocidir: &openat::Dir,
-) -> Result<Layer> {
+) -> Result<oci::Layer> {
     let cancellable = gio::NONE_CANCELLABLE;
-    let mut w = LayerWriter::new(ocidir)?;
+    let mut w = oci::LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
         ostree_metadata_to_tar(repo, ostree_commit, &mut tar, cancellable)?;
@@ -372,80 +235,17 @@ fn export_ostree_ref_to_blobdir(
     w.complete()
 }
 
-/// Write a serializable data (JSON) as an OCI blob
-#[context("Writing json blob")]
-fn write_json_blob<S: serde::Serialize>(ocidir: &openat::Dir, v: &S) -> Result<Blob> {
-    let mut w = BlobWriter::new(ocidir)?;
-    {
-        cjson::to_writer(&mut w, v).map_err(|e| anyhow!("{:?}", e))?;
-    }
-
-    w.complete()
-}
-
 /// Generate an OCI image from a given ostree root
 #[context("Building oci")]
 fn build_oci(repo: &ostree::Repo, commit: &str, ocidir: &Path) -> Result<()> {
-    let utsname = nix::sys::utsname::uname();
-    let arch = MACHINE_TO_OCI[utsname.machine()];
     // Explicitly error if the target exists
     std::fs::create_dir(ocidir).context("Creating OCI dir")?;
     let ocidir = &openat::Dir::open(ocidir)?;
-    ocidir.ensure_dir_all(BLOBDIR, 0o755)?;
-    ocidir.write_file_contents("oci-layout", 0o644, r#"{"imageLayoutVersion":"1.0.0"}"#)?;
+    let writer = &mut oci::OciWriter::new(ocidir)?;
 
     let rootfs_blob = export_ostree_ref_to_blobdir(repo, commit, ocidir)?;
-    let root_layer_id = format!("sha256:{}", rootfs_blob.uncompressed_sha256);
-
-    let config = serde_json::json!({
-        "architecture": arch,
-        "os": "linux",
-        "rootfs": {
-            "type": "layers",
-            "diff_ids": [ root_layer_id ],
-        },
-        "history": [
-            {
-                "commit": "created by ostree-container",
-            }
-        ]
-    });
-    let config_blob = write_json_blob(ocidir, &config)?;
-
-    let manifest_data = serde_json::json!({
-        "schemaVersion": 2,
-        "config": {
-            "mediaType": OCI_TYPE_CONFIG_JSON,
-            "size": config_blob.size,
-            "digest": config_blob.digest_id(),
-        },
-        "layers": [
-            { "mediaType": OCI_TYPE_LAYER,
-              "size": rootfs_blob.blob.size,
-              "digest":  rootfs_blob.blob.digest_id(),
-            }
-        ],
-    });
-    let manifest_blob = write_json_blob(ocidir, &manifest_data)?;
-
-    let index_data = serde_json::json!({
-        "schemaVersion": 2,
-        "manifests": [
-            {
-                "mediaType": OCI_TYPE_MANIFEST_JSON,
-                "digest": manifest_blob.digest_id(),
-                "size": manifest_blob.size,
-                "platform": {
-                    "architecture": arch,
-                    "os": "linux"
-                }
-            }
-        ]
-    });
-    ocidir.write_file_with("index.json", 0o644, |w| -> Result<()> {
-        cjson::to_writer(w, &index_data).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Ok(())
-    })?;
+    writer.set_root_layer(rootfs_blob);
+    writer.complete()?;
 
     Ok(())
 }
@@ -453,7 +253,7 @@ fn build_oci(repo: &ostree::Repo, commit: &str, ocidir: &Path) -> Result<()> {
 /// Helper for `build()` that avoids generics
 fn build_impl(repo: &ostree::Repo, ostree_ref: &str, target: Target) -> Result<()> {
     match target {
-        Target::OciDir(d) => return build_oci(repo, ostree_ref, d),
+        Target::OciDir(d) => build_oci(repo, ostree_ref, d),
     }
 }
 
