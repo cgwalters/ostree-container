@@ -1,9 +1,11 @@
+//! Unstable OCI API
 use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
 use fn_error_context::context;
 use openat_ext::*;
 use openssl::hash::{Hasher, MessageDigest};
 use phf::phf_map;
+use serde::{Deserialize, Serialize};
 use std::io::prelude::*;
 
 /// Map the value from `uname -m` to the Go architecture.
@@ -18,10 +20,59 @@ const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
 const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
+pub const DOCKER_TYPE_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+
 // FIXME get rid of this after updating to https://github.com/coreos/openat-ext/pull/27
 const TMPBLOB: &str = ".tmpblob";
 /// Path inside an OCI directory to the blobs
 const BLOBDIR: &str = "blobs/sha256";
+
+fn default_schema_version() -> u32 {
+    2
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexPlatform {
+    pub architecture: String,
+    pub os: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexManifest {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+
+    pub platform: Option<IndexPlatform>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Index {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
+    pub manifests: Vec<IndexManifest>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestLayer {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
+    pub layers: Vec<ManifestLayer>,
+}
 
 /// Completed blob metadata
 #[derive(Debug)]

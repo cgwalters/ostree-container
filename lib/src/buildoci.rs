@@ -14,7 +14,7 @@ use gvariant::{gv, Marker, Structure};
 use std::{borrow::Cow, collections::HashSet, path::Path};
 
 // This way the default ostree -> sysroot/ostree symlink works.
-const OSTREEDIR: &str = "./sysroot/ostree";
+const OSTREEDIR: &str = "sysroot/ostree";
 
 /// The location to store the generated image
 pub enum Target<'a> {
@@ -101,6 +101,7 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
 
         let mut h = tar::Header::new_gnu();
         h.set_mode(0o644);
+        h.set_size(0);
         let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), xattrs_data)?;
         let mut hexbuf = [0u8; 64];
         hex::encode_to_slice(digest, &mut hexbuf)?;
@@ -129,22 +130,12 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         h.set_uid(meta.get_attribute_uint32("unix::uid") as u64);
         h.set_gid(meta.get_attribute_uint32("unix::gid") as u64);
         h.set_mode(meta.get_attribute_uint32("unix::mode"));
-        let target_header = h.clone();
+        let mut target_header = h.clone();
+        target_header.set_size(0);
 
         if !self.wrote_content.contains(checksum) {
             let inserted = self.wrote_content.insert(checksum.to_string());
             debug_assert!(inserted);
-
-            if let Some(instream) = instream {
-                h.set_entry_type(tar::EntryType::Regular);
-                h.set_size(meta.get_size() as u64);
-                let mut instream = instream.into_read();
-                self.out.append_data(&mut h, &path, &mut instream)?;
-            } else {
-                h.set_entry_type(tar::EntryType::Symlink);
-                h.set_link_name(meta.get_symlink_target().unwrap().as_str())?;
-                self.out.append_data(&mut h, &path, &mut std::io::empty())?;
-            }
 
             if let Some((xattrspath, mut xattrsheader)) = self.append_xattrs(&xattrs)? {
                 xattrsheader.set_entry_type(tar::EntryType::Link);
@@ -152,6 +143,18 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
                 let subpath = format!("{}.xattrs", path);
                 self.out
                     .append_data(&mut xattrsheader, subpath, &mut std::io::empty())?;
+            }
+
+            if let Some(instream) = instream {
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_size(meta.get_size() as u64);
+                let mut instream = instream.into_read();
+                self.out.append_data(&mut h, &path, &mut instream)?;
+            } else {
+                h.set_size(0);
+                h.set_entry_type(tar::EntryType::Symlink);
+                h.set_link_name(meta.get_symlink_target().unwrap().as_str())?;
+                self.out.append_data(&mut h, &path, &mut std::io::empty())?;
             }
         }
 
@@ -224,9 +227,11 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     // Pre create the object directories
     for d in 0..0xFF {
         let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
         h.set_uid(0);
         h.set_gid(0);
         h.set_mode(0o755);
+        h.set_size(0);
         let path = format!("{}/repo/objects/{:#04x}", OSTREEDIR, d);
         out.append_data(&mut h, &path, &mut std::io::empty())?;
     }
@@ -236,6 +241,7 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(0o755);
+        h.set_size(0);
         let path = format!("{}/repo/xattrs", OSTREEDIR);
         out.append_data(&mut h, &path, &mut std::io::empty())?;
     }

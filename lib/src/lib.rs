@@ -3,9 +3,9 @@
 //! This crate contains APIs to bidirectionally map
 //! between OSTree repositories and container images.
 
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 // Good defaults
-#![deny(unused_results)]
+#![forbid(unused_must_use)]
 #![deny(unsafe_code)]
 
 /// Our generic catchall fatal error, expected to be converted
@@ -15,5 +15,6 @@ type Result<T> = anyhow::Result<T>;
 pub mod buildoci;
 pub mod client;
 
-mod oci;
+pub mod oci;
 mod ostree_ext;
+mod variant_utils;
