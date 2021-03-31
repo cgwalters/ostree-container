@@ -312,11 +312,7 @@ fn build_impl(repo: &ostree::Repo, ostree_ref: &str, target: Target) -> Result<(
 }
 
 /// Given an OSTree repository and ref, generate a container image
-pub fn build<R: AsRef<Path>, S: AsRef<str>>(repo: R, ostree_ref: S, target: Target) -> Result<()> {
-    let cancellable = gio::NONE_CANCELLABLE;
-    let repo_path = repo.as_ref();
-    let repo = &ostree::Repo::new_for_path(repo_path);
-    repo.open(cancellable)?;
+pub fn build<S: AsRef<str>>(repo: &ostree::Repo, ostree_ref: S, target: Target) -> Result<()> {
     build_impl(repo, ostree_ref.as_ref(), target)
 }
 

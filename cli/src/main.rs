@@ -23,8 +23,9 @@ enum Opt {
 
 fn build(opts: &BuildOpts) -> Result<()> {
     let path = Path::new(&opts.oci_dir);
+    let repo = &ostree::Repo::open_at(libc::AT_FDCWD, opts.repo.as_str(), gio::NONE_CANCELLABLE)?;
     Ok(ostree_container::buildoci::build(
-        &opts.repo,
+        repo,
         &opts.ostree_ref,
         ostree_container::buildoci::Target::OciDir(path),
     )?)
