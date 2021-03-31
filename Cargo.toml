@@ -1,14 +1,6 @@
-[package]
-name = "ostree-container-tool"
-version = "0.1.0"
-authors = ["Colin Walters <walters@verbum.org>"]
-edition = "2018"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/cgwalters/ostree-container"
-readme = "README.md"
+[workspace]
+members = ["cli", "lib"]
 
-[dependencies]
-anyhow = "1.0"
-ostree-container = { path = "lib" }
-clap = "2.33.3"
-structopt = "0.3.21"
+[profile.release]
+codegen-units = 1
+lto = "thin"
