@@ -143,10 +143,11 @@ impl<'a> OciWriter<'a> {
                 }
             ]
         });
-        self.dir.write_file_with("index.json", 0o644, |w| -> Result<()> {
-            cjson::to_writer(w, &index_data).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-            Ok(())
-        })?;
+        self.dir
+            .write_file_with("index.json", 0o644, |w| -> Result<()> {
+                cjson::to_writer(w, &index_data).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                Ok(())
+            })?;
 
         Ok(())
     }

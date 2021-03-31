@@ -5,7 +5,7 @@ use super::Result;
 use crate::oci;
 use crate::ostree_ext::*;
 use anyhow::Context;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use fn_error_context::context;
 use gio::prelude::*;
 use gvariant::aligned_bytes::TryAsAligned;
@@ -36,9 +36,10 @@ struct OstreeMetadataWriter<'a, W: std::io::Write> {
     wrote_dirtree: HashSet<String>,
     wrote_dirmeta: HashSet<String>,
     wrote_content: HashSet<String>,
+    wrote_xattrs: HashSet<String>,
 }
 
-fn object_path(objtype: ostree::ObjectType, checksum: &str) -> String {
+fn object_path(objtype: ostree::ObjectType, checksum: &str) -> Utf8PathBuf {
     let suffix = match objtype {
         ostree::ObjectType::Commit => "commit",
         ostree::ObjectType::CommitMeta => "commitmeta",
@@ -48,7 +49,11 @@ fn object_path(objtype: ostree::ObjectType, checksum: &str) -> String {
         o => panic!("Unexpected object type: {:?}", o),
     };
     let (first, rest) = checksum.split_at(2);
-    format!("{}/repo/objects/{}/{}.{}", OSTREEDIR, first, rest, suffix)
+    format!("{}/repo/objects/{}/{}.{}", OSTREEDIR, first, rest, suffix).into()
+}
+
+fn xattrs_path(checksum: &str) -> Utf8PathBuf {
+    format!("{}/repo/xattrs/{}", OSTREEDIR, checksum).into()
 }
 
 impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
@@ -84,11 +89,41 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         Ok(())
     }
 
-    fn append_content(&mut self, checksum: &str) -> Result<(String, tar::Header)> {
+    fn append_xattrs(
+        &mut self,
+        xattrs: &glib::Variant,
+    ) -> Result<Option<(Utf8PathBuf, tar::Header)>> {
+        let xattrs_data = xattrs.get_data_as_bytes();
+        let xattrs_data = xattrs_data.as_ref();
+        if xattrs_data.is_empty() {
+            return Ok(None);
+        }
+
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o644);
+        let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), xattrs_data)?;
+        let mut hexbuf = [0u8; 64];
+        hex::encode_to_slice(digest, &mut hexbuf)?;
+        let checksum = std::str::from_utf8(&hexbuf)?;
+        let path = xattrs_path(checksum);
+
+        if !self.wrote_xattrs.contains(checksum) {
+            let inserted = self.wrote_xattrs.insert(checksum.to_string());
+            debug_assert!(inserted);
+            let mut target_header = h.clone();
+            target_header.set_size(xattrs_data.len() as u64);
+            self.out
+                .append_data(&mut target_header, &path, xattrs_data)?;
+        }
+        Ok(Some((path, h)))
+    }
+
+    fn append_content(&mut self, checksum: &str) -> Result<(Utf8PathBuf, tar::Header)> {
         let path = object_path(ostree::ObjectType::File, checksum);
 
         let (instream, meta, xattrs) = self.repo.load_file(checksum, gio::NONE_CANCELLABLE)?;
         let meta = meta.unwrap();
+        let xattrs = xattrs.unwrap();
 
         let mut h = tar::Header::new_gnu();
         h.set_uid(meta.get_attribute_uint32("unix::uid") as u64);
@@ -109,6 +144,14 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
                 h.set_entry_type(tar::EntryType::Symlink);
                 h.set_link_name(meta.get_symlink_target().unwrap().as_str())?;
                 self.out.append_data(&mut h, &path, &mut std::io::empty())?;
+            }
+
+            if let Some((xattrspath, mut xattrsheader)) = self.append_xattrs(&xattrs)? {
+                xattrsheader.set_entry_type(tar::EntryType::Link);
+                xattrsheader.set_link_name(xattrspath)?;
+                let subpath = format!("{}.xattrs", path);
+                self.out
+                    .append_data(&mut xattrsheader, subpath, &mut std::io::empty())?;
             }
         }
 
@@ -188,12 +231,22 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
         out.append_data(&mut h, &path, &mut std::io::empty())?;
     }
 
+    // Write out the xattrs directory
+    {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o755);
+        let path = format!("{}/repo/xattrs", OSTREEDIR);
+        out.append_data(&mut h, &path, &mut std::io::empty())?;
+    }
+
     let writer = &mut OstreeMetadataWriter {
         repo,
         out,
         wrote_dirmeta: HashSet::new(),
         wrote_dirtree: HashSet::new(),
         wrote_content: HashSet::new(),
+        wrote_xattrs: HashSet::new(),
     };
     let (commit_v, _) = repo.load_commit(commit_checksum)?;
     let commit_v = &commit_v;
@@ -222,14 +275,15 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
 #[context("Writing ostree root to blob")]
 fn export_ostree_ref_to_blobdir(
     repo: &ostree::Repo,
-    ostree_commit: &str,
+    rev: &str,
     ocidir: &openat::Dir,
 ) -> Result<oci::Layer> {
+    let commit = repo.resolve_rev(rev, false)?;
     let cancellable = gio::NONE_CANCELLABLE;
     let mut w = oci::LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
-        ostree_metadata_to_tar(repo, ostree_commit, &mut tar, cancellable)?;
+        ostree_metadata_to_tar(repo, commit.as_str(), &mut tar, cancellable)?;
         tar.finish()?;
     }
     w.complete()
