@@ -14,4 +14,5 @@ clap = "2.33.3"
 structopt = "0.3.21"
 ostree = { version = "0.9.1", features = ["v2020_4"] }
 libc = "0.2.92"
+tokio = { version = "1", features = ["full"] }
 gio = "0.9.1"

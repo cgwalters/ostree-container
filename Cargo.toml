@@ -4,3 +4,6 @@ members = ["cli", "lib"]
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+[patch.crates-io]
+oci-distribution = { path = '../../deislabs/krustlet/crates/oci-distribution' }

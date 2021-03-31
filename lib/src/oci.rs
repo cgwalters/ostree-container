@@ -18,6 +18,8 @@ const OCI_TYPE_CONFIG_JSON: &str = "application/vnd.oci.image.config.v1+json";
 const OCI_TYPE_MANIFEST_JSON: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_TYPE_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
+pub(super) const DOCKER_TYPE_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+
 // FIXME get rid of this after updating to https://github.com/coreos/openat-ext/pull/27
 const TMPBLOB: &str = ".tmpblob";
 /// Path inside an OCI directory to the blobs

@@ -29,9 +29,13 @@ camino = "1.0.4"
 glib-sys = "0.10.1"
 gvariant = "0.4.0"
 libc = "0.2.92"
+oci-distribution = "0.6.0"
+futures = "0.3.13"
 
 [dev-dependencies]
 tempfile = "3.2.0"
 indoc = "1.0.3"
 sh-inline = "0.1.0"
-
+clap = "2.33.3"
+structopt = "0.3.21"
+tokio = { version = "1", features = ["full"] }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ostree_container::client;
 use std::path::Path;
 use structopt::StructOpt;
 
@@ -15,10 +16,20 @@ struct BuildOpts {
 }
 
 #[derive(Debug, StructOpt)]
+struct PullOpts {
+    #[structopt(long)]
+    repo: String,
+
+    /// Source container image location
+    imgref: String,
+}
+
+#[derive(Debug, StructOpt)]
 #[structopt(name = "ostree-container")]
 #[structopt(rename_all = "kebab-case")]
 enum Opt {
     Build(BuildOpts),
+    Pull(PullOpts),
 }
 
 fn build(opts: &BuildOpts) -> Result<()> {
@@ -31,15 +42,24 @@ fn build(opts: &BuildOpts) -> Result<()> {
     )?)
 }
 
-fn run() -> Result<()> {
+async fn pull(opt: &PullOpts) -> Result<()> {
+    let repo = &ostree::Repo::open_at(libc::AT_FDCWD, opt.repo.as_str(), gio::NONE_CANCELLABLE)?;
+    let res = client::import(repo, &opt.imgref).await?;
+    println!("Imported: {}", res.ostree_commit);
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let opt = Opt::from_args();
     match opt {
-        Opt::Build(ref buildopts) => build(buildopts),
+        Opt::Build(ref opt) => build(opt),
+        Opt::Pull(ref opt) => pull(opt).await,
     }
 }
 
-fn main() {
-    if let Err(e) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run().await {
         eprintln!("error: {:#}", e);
         std::process::exit(1);
     }

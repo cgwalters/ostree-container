@@ -2,16 +2,30 @@ use anyhow::Result;
 use camino::Utf8Path;
 use indoc::indoc;
 use sh_inline::bash;
+use structopt::StructOpt;
 
 const EXAMPLEOS_TAR: &[u8] = include_bytes!("fixtures/exampleos.tar.zst");
 const TESTREF: &str = "exampleos/x86_64/stable";
 const CONTENT_CHECKSUM: &str = "0ef7461f9db15e1d8bd8921abf20694225fbaa4462cadf7deed8ea0e43162120";
 
-fn run() -> Result<()> {
+#[derive(Debug, StructOpt)]
+struct GenerateOpts {
+    #[structopt(long)]
+    dir: String,
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "ostree-container-test-e2e")]
+#[structopt(rename_all = "kebab-case")]
+enum Opt {
+    GenerateOci(GenerateOpts),
+}
+
+fn generate(opts: &GenerateOpts) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
-    let tempdir = tempfile::tempdir()?;
-    let path = Utf8Path::from_path(tempdir.path()).unwrap();
-    std::fs::write(path.join("exampleos.tar.zst"), EXAMPLEOS_TAR)?;
+    let path = Utf8Path::new(&opts.dir);
+    let tarpath = &path.join("exampleos.tar.zst");
+    std::fs::write(tarpath, EXAMPLEOS_TAR)?;
     bash!(
         indoc! {"
         cd {path}
@@ -22,6 +36,7 @@ fn run() -> Result<()> {
         testref = TESTREF,
         path = path.as_str()
     )?;
+    std::fs::remove_file(tarpath)?;
     let repopath = &path.join("repo-archive");
     let repo = &ostree::Repo::open_at(libc::AT_FDCWD, repopath.as_str(), cancellable)?;
     let (_, rev) = repo.read_commit(TESTREF, cancellable)?;
@@ -39,7 +54,14 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn main() {
+fn run() -> Result<()> {
+    match Opt::from_args() {
+        Opt::GenerateOci(ref args) => generate(args),
+    }
+}
+
+#[tokio::main]
+async fn main() {
     if let Err(e) = run() {
         eprintln!("error: {:#}", e);
         std::process::exit(1);
