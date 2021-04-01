@@ -3,7 +3,7 @@
 //! This crate contains APIs to bidirectionally map
 //! between OSTree repositories and container images.
 
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 // Good defaults
 #![deny(unused_results)]
 #![deny(unsafe_code)]
@@ -15,6 +15,6 @@ type Result<T> = anyhow::Result<T>;
 pub mod buildoci;
 pub mod client;
 
-mod oci;
+pub mod oci;
 mod ostree_ext;
 mod import;

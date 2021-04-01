@@ -1,7 +1,11 @@
-use anyhow::Result;
-use camino::Utf8Path;
+use std::fs::File;
+
+use anyhow::{anyhow, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 use indoc::indoc;
 use sh_inline::bash;
+
+use ostree_container::oci as myoci;
 
 const EXAMPLEOS_TAR: &[u8] = include_bytes!("fixtures/exampleos.tar.zst");
 const TESTREF: &str = "exampleos/x86_64/stable";
@@ -37,12 +41,36 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<()> {
     let ocitarget = ostree_container::buildoci::Target::OciDir(ocipath.as_ref());
     ostree_container::buildoci::build(repo, TESTREF, ocitarget)?;
     //bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
+    bash!("ls -al {ocipath}/blobs/sha256", ocipath = ocipath.as_str())?;
     Ok(())
 }
 
+fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<Utf8PathBuf> {
+    let indexf = std::io::BufReader::new(File::open(ocidir.join("index.json"))?);
+    let index: myoci::Index = serde_json::from_reader(indexf)?;
+    let manifest = index
+        .manifests
+        .get(0)
+        .ok_or_else(|| anyhow!("Missing manifest in index.json"))?;
+
+    todo!();
+}
+
 #[test]
-fn test_oci() -> Result<()> {
+fn test_e2e() -> Result<()> {
+    let cancellable = gio::NONE_CANCELLABLE;
+
     let tempdir = tempfile::tempdir()?;
     let path = Utf8Path::from_path(tempdir.path()).unwrap();
-    generate_test_oci(path)
+    let srcdir = &path.join("src");
+    std::fs::create_dir(srcdir)?;
+    generate_test_oci(srcdir)?;
+    let destdir = &path.join("dest");
+    std::fs::create_dir(destdir)?;
+    let destrepodir = &destdir.join("repo");
+    let destrepo = ostree::Repo::new_for_path(destrepodir);
+    destrepo.create(ostree::RepoMode::Archive, cancellable)?;
+
+    // ostree_container::client::import(repo, )
+    Ok(())
 }
