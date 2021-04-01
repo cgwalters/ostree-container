@@ -43,7 +43,6 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<Utf8PathBuf> {
     let ocitarget = ostree_container::buildoci::Target::OciDir(ocipath.as_ref());
     ostree_container::buildoci::build(repo, TESTREF, ocitarget)?;
     //bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
-    bash!("ls -al {ocipath}/blobs/sha256", ocipath = ocipath.as_str())?;
     Ok(ocipath)
 }
 

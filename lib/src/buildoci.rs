@@ -14,7 +14,7 @@ use gvariant::{gv, Marker, Structure};
 use std::{borrow::Cow, collections::HashSet, path::Path};
 
 // This way the default ostree -> sysroot/ostree symlink works.
-const OSTREEDIR: &str = "./sysroot/ostree";
+const OSTREEDIR: &str = "sysroot/ostree";
 
 /// The location to store the generated image
 pub enum Target<'a> {
@@ -137,6 +137,14 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
             let inserted = self.wrote_content.insert(checksum.to_string());
             debug_assert!(inserted);
 
+            if let Some((xattrspath, mut xattrsheader)) = self.append_xattrs(&xattrs)? {
+                xattrsheader.set_entry_type(tar::EntryType::Link);
+                xattrsheader.set_link_name(xattrspath)?;
+                let subpath = format!("{}.xattrs", path);
+                self.out
+                    .append_data(&mut xattrsheader, subpath, &mut std::io::empty())?;
+            }
+
             if let Some(instream) = instream {
                 h.set_entry_type(tar::EntryType::Regular);
                 h.set_size(meta.get_size() as u64);
@@ -147,14 +155,6 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
                 h.set_entry_type(tar::EntryType::Symlink);
                 h.set_link_name(meta.get_symlink_target().unwrap().as_str())?;
                 self.out.append_data(&mut h, &path, &mut std::io::empty())?;
-            }
-
-            if let Some((xattrspath, mut xattrsheader)) = self.append_xattrs(&xattrs)? {
-                xattrsheader.set_entry_type(tar::EntryType::Link);
-                xattrsheader.set_link_name(xattrspath)?;
-                let subpath = format!("{}.xattrs", path);
-                self.out
-                    .append_data(&mut xattrsheader, subpath, &mut std::io::empty())?;
             }
         }
 
