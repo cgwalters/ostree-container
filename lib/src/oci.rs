@@ -54,7 +54,7 @@ pub struct Index {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
 
-    pub manifests: Vec<IndexManifest>
+    pub manifests: Vec<IndexManifest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,5 +1,7 @@
 //! APIs for extracting OSTree commits from container images
 
+use std::collections::HashMap;
+
 use super::Result;
 use anyhow::anyhow;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -72,53 +74,134 @@ pub async fn import<I: AsRef<str>>(repo: &ostree::Repo, image_ref: I) -> Result<
 }
 
 enum ImportState {
-    Commit,
-    Objects,
+    Initial,
+    Importing(String),
 }
 
 struct Importer<'a> {
     state: ImportState,
     repo: &'a ostree::Repo,
+    xattrs: HashMap<String, Box<[u8]>>,
 }
 
-//if header.entry_type() != tar::EntryType::Regular {
-//    continue
-//}
-
-fn import_commit<R: std::io::Read>(
-    importer: &mut Importer,
-    entry: &mut tar::Entry<R>,
-    checksum: &str,
-) -> Result<()> {
-    todo!()
+impl<'a> Drop for Importer<'a> {
+    fn drop(&mut self) {
+        let _ = self.repo.abort_transaction(gio::NONE_CANCELLABLE);
+    }
 }
 
-fn import_content_object<R: std::io::Read>(
-    importer: &mut Importer,
-    entry: &mut tar::Entry<R>,
-    checksum: &str,
-    objtype: &str,
-) -> Result<()> {
-    todo!()
+fn validate_metadata_header(header: &tar::Header, desc: &str) -> Result<()> {
+    if header.entry_type() != tar::EntryType::Regular {
+        return Err(anyhow!("Invalid non-regular metadata object {}", desc));
+    }
+    let size = header.size()?;
+    let max_size = 10u64 * 1024 * 1024;
+    if size > max_size {
+        return Err(anyhow!(
+            "object of size {} exceeds {} bytes",
+            size,
+            max_size
+        ));
+    }
+    Ok(())
 }
 
-fn import_object<'b, R: std::io::Read>(
-    importer: &mut Importer,
-    entry: &mut tar::Entry<'b, R>,
-    objpath: &Utf8Path,
-) -> Result<()> {
-    let checksum = objpath
-        .file_stem()
-        .ok_or_else(|| anyhow!("Invalid objpath {}", objpath))?;
-    validate_sha256(checksum)?;
-    let objtype = objpath
-        .extension()
-        .ok_or_else(|| anyhow!("Invalid objpath {}", objpath))?;
+fn entry_to_variant<R: std::io::Read>(
+    mut entry: tar::Entry<R>,
+    vtype: &str,
+    desc: &str,
+) -> Result<glib::Variant> {
+    let header = entry.header();
+    validate_metadata_header(header, desc)?;
 
-    match (objtype, &importer.state) {
-        ("commit", ImportState::Commit) => import_commit(importer, entry, checksum),
-        ("commit", ImportState::Objects) => return Err(anyhow!("Found multiple commit objects")),
-        (o, s) => import_content_object(importer, entry, checksum, objtype),
+    let mut buf: Vec<u8> = Vec::with_capacity(header.size()? as usize);
+    let n = std::io::copy(&mut entry, &mut buf)?;
+    let v = glib::Bytes::from_owned(buf);
+    Ok(crate::variant_utils::variant_new_from_bytes(
+        vtype, v, false,
+    ))
+}
+
+impl<'a> Importer<'a> {
+
+    fn import_commit<R: std::io::Read>(
+        &mut self,
+        entry: tar::Entry<R>,
+        checksum: &str,
+    ) -> Result<()> {
+        let v = entry_to_variant(entry, "(a{sv}aya(say)sstayay)", checksum)?;
+        // FIXME insert expected dirtree/dirmeta
+        let _ = self.repo.write_metadata(
+            ostree::ObjectType::Commit,
+            Some(checksum),
+            &v,
+            gio::NONE_CANCELLABLE,
+        )?;
+        self.state = ImportState::Importing(checksum.to_string());
+        todo!()
+    }
+    
+    fn import_content_object<R: std::io::Read>(
+        &mut self,
+        entry: tar::Entry<R>,
+        checksum: &str,
+        objtype: &str,
+    ) -> Result<()> {
+        todo!()
+    }
+    
+    fn import_object<'b, R: std::io::Read>(
+        &mut self,
+        entry: tar::Entry<'b, R>,
+        objpath: &Utf8Path,
+    ) -> Result<()> {
+        let checksum = objpath
+            .file_stem()
+            .ok_or_else(|| anyhow!("Invalid objpath {}", objpath))?;
+        validate_sha256(checksum)?;
+        let objtype = objpath
+            .extension()
+            .ok_or_else(|| anyhow!("Invalid objpath {}", objpath))?;
+    
+        match (objtype, &self.state) {
+            ("commit", ImportState::Initial) => self.import_commit(entry, checksum),
+            (o, ImportState::Initial) => {
+                return Err(anyhow!("Found content object {} before commit", o))
+            }
+            ("commit", ImportState::Importing(c)) => {
+                return Err(anyhow!("Found multiple commit objects; original: {}", c))
+            }
+            (objtype, ImportState::Importing(_)) => {
+                self.import_content_object(entry, checksum, objtype)
+            }
+        }
+    }
+
+
+    fn import_xattrs<'b, R: std::io::Read>(
+        &mut self,
+        entry: tar::Entry<'b, R>,
+    ) -> Result<()> {
+        match &self.state {
+            ImportState::Initial => return Err(anyhow!("Found xattr object {} before commit")),
+            ImportState::Importing(_) => {}
+        }
+        let path = entry.path()?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid xattr dir: {:?}", path))?;
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid non-UTF8 xattr name: {:?}", name))?;
+        validate_sha256(name)?;
+        let header = entry.header();
+        if header.entry_type() != tar::EntryType::Regular {
+            return Err(anyhow!(
+                "Invalid xattr entry of type {:?}",
+                header.entry_type()
+            ));
+        }
+        todo!()
     }
 }
 
@@ -132,39 +215,18 @@ fn validate_sha256(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn import_xattrs<'b, R: std::io::Read>(
-    importer: &mut Importer,
-    entry: &mut tar::Entry<'b, R>,
-) -> Result<()> {
-    let path = entry.path()?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid xattr dir: {:?}", path))?;
-    let name = name
-        .to_str()
-        .ok_or_else(|| anyhow!("Invalid non-UTF8 xattr name: {:?}", name))?;
-    validate_sha256(name)?;
-    let header = entry.header();
-    if header.entry_type() != tar::EntryType::Regular {
-        return Err(anyhow!(
-            "Invalid xattr entry of type {:?}",
-            header.entry_type()
-        ));
-    }
-    todo!()
-}
-
 /// Import a tarball
 #[context("Importing")]
 pub fn import_tarball(repo: &ostree::Repo, src: impl std::io::Read) -> Result<String> {
     let importer = &mut Importer {
-        state: ImportState::Commit,
+        state: ImportState::Initial,
         repo,
+        xattrs: Default::default(),
     };
     let ungz = flate2::read::GzDecoder::new(src);
     let mut archive = tar::Archive::new(ungz);
     for entry in archive.entries()? {
-        let entry = &mut entry?;
+        let entry = entry?;
         let path = entry.path()?;
         let path = &*path;
         let path =
@@ -191,9 +253,9 @@ pub fn import_tarball(repo: &ostree::Repo, src: impl std::io::Read) -> Result<St
                 return Err(anyhow!("Invalid checksum rest {}", name));
             }
             let path: Utf8PathBuf = format!("{}{}", parentname, name).into();
-            import_object(importer, entry, &path)?;
+            importer.import_object(entry, &path)?;
         } else if let Ok(_) = path.strip_prefix("xattrs/") {
-            import_xattrs(importer, entry)?;
+            importer.import_xattrs(entry)?;
         }
     }
     Ok("".into())

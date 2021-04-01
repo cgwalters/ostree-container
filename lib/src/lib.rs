@@ -5,7 +5,7 @@
 
 //#![deny(missing_docs)]
 // Good defaults
-#![deny(unused_results)]
+#![forbid(unused_must_use)]
 #![deny(unsafe_code)]
 
 /// Our generic catchall fatal error, expected to be converted
@@ -17,3 +17,4 @@ pub mod client;
 
 pub mod oci;
 mod ostree_ext;
+mod variant_utils;
