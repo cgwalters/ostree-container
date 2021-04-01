@@ -2,6 +2,7 @@
 
 use super::Result;
 use anyhow::anyhow;
+use fn_error_context::context;
 
 use oci_distribution::manifest::OciDescriptor;
 
@@ -14,6 +15,7 @@ pub struct Import {
     pub image_digest: String,
 }
 
+#[context("Fetching layer descriptor")]
 async fn fetch_layer_descriptor(
     client: &mut oci_distribution::Client,
     image_ref: &oci_distribution::Reference,
@@ -39,6 +41,7 @@ async fn fetch_layer_descriptor(
     }
 }
 
+#[context("Importing {}", image_ref)]
 async fn import_impl(_repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
     let image_ref: oci_distribution::Reference = image_ref.parse()?;
     let client = &mut oci_distribution::Client::default();
@@ -65,4 +68,16 @@ async fn import_impl(_repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
 /// Download and import the referenced container
 pub async fn import<I: AsRef<str>>(repo: &ostree::Repo, image_ref: I) -> Result<Import> {
     Ok(import_impl(repo, image_ref.as_ref()).await?)
+}
+
+/// Import a tarball
+#[context("Importing")]
+pub fn import_tarball(_repo: &ostree::Repo, src: impl std::io::Read) -> Result<String> {
+    let ungz = flate2::read::GzDecoder::new(src);
+    let mut archive = tar::Archive::new(ungz);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        dbg!(entry.path()?);
+    }
+    Ok("".into())
 }

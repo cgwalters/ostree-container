@@ -1,7 +1,8 @@
-use std::fs::File;
+use std::{fs::File, io::BufReader};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use fn_error_context::context;
 use indoc::indoc;
 use sh_inline::bash;
 
@@ -11,7 +12,8 @@ const EXAMPLEOS_TAR: &[u8] = include_bytes!("fixtures/exampleos.tar.zst");
 const TESTREF: &str = "exampleos/x86_64/stable";
 const CONTENT_CHECKSUM: &str = "0ef7461f9db15e1d8bd8921abf20694225fbaa4462cadf7deed8ea0e43162120";
 
-fn generate_test_oci(dir: &Utf8Path) -> Result<()> {
+#[context("Generating test OCI")]
+fn generate_test_oci(dir: &Utf8Path) -> Result<Utf8PathBuf> {
     let cancellable = gio::NONE_CANCELLABLE;
     let path = Utf8Path::new(dir);
     let tarpath = &path.join("exampleos.tar.zst");
@@ -37,23 +39,46 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<()> {
             .as_str(),
         CONTENT_CHECKSUM
     );
-    let ocipath = &path.join("exampleos-oci");
+    let ocipath = path.join("exampleos-oci");
     let ocitarget = ostree_container::buildoci::Target::OciDir(ocipath.as_ref());
     ostree_container::buildoci::build(repo, TESTREF, ocitarget)?;
     //bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
     bash!("ls -al {ocipath}/blobs/sha256", ocipath = ocipath.as_str())?;
-    Ok(())
+    Ok(ocipath)
 }
 
-fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<Utf8PathBuf> {
-    let indexf = std::io::BufReader::new(File::open(ocidir.join("index.json"))?);
-    let index: myoci::Index = serde_json::from_reader(indexf)?;
+fn read_blob(ocidir: &Utf8Path, digest: &str) -> Result<BufReader<File>> {
+    let digest = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("Unknown algorithim in digest {}", digest))?;
+    let f = File::open(ocidir.join("blobs/sha256").join(digest))
+        .with_context(|| format!("Opening blob {}", digest))?;
+    Ok(std::io::BufReader::new(f))
+}
+
+#[context("Parsing OCI")]
+fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<BufReader<File>> {
+    let f = std::io::BufReader::new(
+        File::open(ocidir.join("index.json")).context("Opening index.json")?,
+    );
+    let index: myoci::Index = serde_json::from_reader(f)?;
     let manifest = index
         .manifests
         .get(0)
         .ok_or_else(|| anyhow!("Missing manifest in index.json"))?;
-
-    todo!();
+    let f = read_blob(ocidir, &manifest.digest)?;
+    let manifest: myoci::Manifest = serde_json::from_reader(f)?;
+    let layer = manifest
+        .layers
+        .iter()
+        .find(|layer| {
+            matches!(
+                layer.media_type.as_str(),
+                myoci::DOCKER_TYPE_LAYER | oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE
+            )
+        })
+        .ok_or_else(|| anyhow!("Failed to find rootfs layer"))?;
+    Ok(read_blob(ocidir, &layer.digest)?)
 }
 
 #[test]
@@ -64,13 +89,15 @@ fn test_e2e() -> Result<()> {
     let path = Utf8Path::from_path(tempdir.path()).unwrap();
     let srcdir = &path.join("src");
     std::fs::create_dir(srcdir)?;
-    generate_test_oci(srcdir)?;
+    let ocidir = &generate_test_oci(srcdir)?;
     let destdir = &path.join("dest");
     std::fs::create_dir(destdir)?;
     let destrepodir = &destdir.join("repo");
     let destrepo = ostree::Repo::new_for_path(destrepodir);
     destrepo.create(ostree::RepoMode::Archive, cancellable)?;
 
-    // ostree_container::client::import(repo, )
+    let tarf = find_layer_in_oci(ocidir)?;
+    let res = ostree_container::client::import_tarball(&destrepo, tarf)?;
+    dbg!(res);
     Ok(())
 }

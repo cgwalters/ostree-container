@@ -17,4 +17,3 @@ pub mod client;
 
 pub mod oci;
 mod ostree_ext;
-mod import;

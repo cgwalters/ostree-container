@@ -101,6 +101,7 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
 
         let mut h = tar::Header::new_gnu();
         h.set_mode(0o644);
+        h.set_size(0);
         let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), xattrs_data)?;
         let mut hexbuf = [0u8; 64];
         hex::encode_to_slice(digest, &mut hexbuf)?;
@@ -129,7 +130,8 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         h.set_uid(meta.get_attribute_uint32("unix::uid") as u64);
         h.set_gid(meta.get_attribute_uint32("unix::gid") as u64);
         h.set_mode(meta.get_attribute_uint32("unix::mode"));
-        let target_header = h.clone();
+        let mut target_header = h.clone();
+        target_header.set_size(0);
 
         if !self.wrote_content.contains(checksum) {
             let inserted = self.wrote_content.insert(checksum.to_string());
@@ -141,6 +143,7 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
                 let mut instream = instream.into_read();
                 self.out.append_data(&mut h, &path, &mut instream)?;
             } else {
+                h.set_size(0);
                 h.set_entry_type(tar::EntryType::Symlink);
                 h.set_link_name(meta.get_symlink_target().unwrap().as_str())?;
                 self.out.append_data(&mut h, &path, &mut std::io::empty())?;
@@ -227,6 +230,7 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
         h.set_uid(0);
         h.set_gid(0);
         h.set_mode(0o755);
+        h.set_size(0);
         let path = format!("{}/repo/objects/{:#04x}", OSTREEDIR, d);
         out.append_data(&mut h, &path, &mut std::io::empty())?;
     }
@@ -236,6 +240,7 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(0o755);
+        h.set_size(0);
         let path = format!("{}/repo/xattrs", OSTREEDIR);
         out.append_data(&mut h, &path, &mut std::io::empty())?;
     }
