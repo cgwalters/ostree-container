@@ -1,7 +1,6 @@
 use glib::translate::*;
 
 #[allow(unsafe_code)]
-
 pub(crate) fn variant_new_from_bytes(ty: &str, bytes: glib::Bytes, trusted: bool) -> glib::Variant {
     unsafe {
         let ty = ty.to_glib_none();
@@ -12,6 +11,15 @@ pub(crate) fn variant_new_from_bytes(ty: &str, bytes: glib::Bytes, trusted: bool
         glib_sys::g_variant_ref_sink(v);
         from_glib_full(v)
     }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn variant_get_normal_form(v: &glib::Variant) -> glib::Variant {
+    unsafe { from_glib_full(glib_sys::g_variant_get_normal_form(v.to_glib_none().0)) }
+}
+
+pub(crate) fn variant_normal_from_bytes(ty: &str, bytes: glib::Bytes) -> glib::Variant {
+    variant_get_normal_form(&variant_new_from_bytes(ty, bytes, false))
 }
 
 #[cfg(test)]

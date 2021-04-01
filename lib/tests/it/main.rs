@@ -24,6 +24,7 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<Utf8PathBuf> {
         ostree --repo=repo-archive init --mode=archive
         ostree --repo=repo-archive commit -b {testref} --tree=tar=exampleos.tar.zst
         ostree --repo=repo-archive show {testref}
+        ostree --repo=repo-archive ls -R -X -C {testref}
     "},
         testref = TESTREF,
         path = path.as_str()
@@ -42,7 +43,7 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<Utf8PathBuf> {
     let ocipath = path.join("exampleos-oci");
     let ocitarget = ostree_container::buildoci::Target::OciDir(ocipath.as_ref());
     ostree_container::buildoci::build(repo, TESTREF, ocitarget)?;
-    //bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
+    bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
     Ok(ocipath)
 }
 
@@ -104,5 +105,10 @@ fn test_e2e() -> Result<()> {
             .unwrap()
             .as_str()
     );
+    bash!(
+        "ostree --repo={destrepodir} ls -R {imported_commit}",
+        destrepodir = destrepodir.as_str(),
+        imported_commit = imported_commit.as_str()
+    )?;
     Ok(())
 }

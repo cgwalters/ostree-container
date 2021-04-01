@@ -1,13 +1,22 @@
 //! APIs for extracting OSTree commits from container images
 
-use std::collections::HashMap;
-
 use super::Result;
+use crate::variant_utils::variant_new_from_bytes;
 use anyhow::anyhow;
 use camino::Utf8Path;
 use fn_error_context::context;
+use std::collections::HashMap;
+use std::io::prelude::*;
+use std::io::Read;
 
 use oci_distribution::manifest::OciDescriptor;
+
+const MAX_XATTR_SIZE: u32 = 1024 * 1024;
+
+const OSTREE_COMMIT_FORMAT: &str = "(a{sv}aya(say)sstayay)";
+const OSTREE_DIRTREE_FORMAT: &str = "(a(say)a(sayay))";
+const OSTREE_DIRMETA_FORMAT: &str = "(uuua(ayay))";
+const OSTREE_XATTRS_FORMAT: &str = "a(ayay)";
 
 /// The result of an imported container with an embedded ostree.
 #[derive(Debug)]
@@ -73,6 +82,7 @@ pub async fn import<I: AsRef<str>>(repo: &ostree::Repo, image_ref: I) -> Result<
     Ok(import_impl(repo, image_ref.as_ref()).await?)
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ImportState {
     Initial,
     Importing(String),
@@ -81,7 +91,7 @@ enum ImportState {
 struct Importer<'a> {
     state: ImportState,
     repo: &'a ostree::Repo,
-    xattrs: HashMap<String, Box<[u8]>>,
+    xattrs: HashMap<String, glib::Variant>,
     next_xattrs: Option<(String, String)>,
 }
 
@@ -107,6 +117,56 @@ fn validate_metadata_header(header: &tar::Header, desc: &str) -> Result<usize> {
     Ok(size as usize)
 }
 
+fn header_to_gfileinfo(header: &tar::Header) -> Result<gio::FileInfo> {
+    let i = gio::FileInfo::new();
+    let t = match header.entry_type() {
+        tar::EntryType::Regular => gio::FileType::Regular,
+        tar::EntryType::Symlink => gio::FileType::SymbolicLink,
+        o => return Err(anyhow!("Invalid tar type: {:?}", o)),
+    };
+    i.set_file_type(t);
+    i.set_size(0);
+    let uid = header.uid()? as u32;
+    let gid = header.gid()? as u32;
+    let mode = header.mode()?;
+    i.set_attribute_uint32("unix::uid", uid);
+    i.set_attribute_uint32("unix::gid", gid);
+    i.set_attribute_uint32("unix::mode", mode);
+    if t == gio::FileType::Regular {
+        i.set_size(header.size()? as i64)
+    } else {
+        i.set_attribute_boolean("standard::is-symlink", true);
+        let target = header.link_name()?;
+        let target = target.ok_or_else(|| anyhow!("Invalid symlink"))?;
+        let target = target
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| anyhow!("Non-utf8 symlink"))?;
+        i.set_symlink_target(target);
+    }
+
+    Ok(i)
+}
+
+fn format_for_objtype(t: ostree::ObjectType) -> Option<&'static str> {
+    match t {
+        ostree::ObjectType::DirTree => Some(OSTREE_DIRTREE_FORMAT),
+        ostree::ObjectType::DirMeta => Some(OSTREE_DIRMETA_FORMAT),
+        ostree::ObjectType::Commit => Some(OSTREE_COMMIT_FORMAT),
+        _ => None,
+    }
+}
+
+fn objtype_from_string(t: &str) -> Option<ostree::ObjectType> {
+    Some(match t {
+        "commit" => ostree::ObjectType::Commit,
+        "dirtree" => ostree::ObjectType::DirTree,
+        "dirmeta" => ostree::ObjectType::DirMeta,
+        "file" => ostree::ObjectType::File,
+        _ => return None,
+    })
+}
+
 fn entry_to_variant<R: std::io::Read>(
     mut entry: tar::Entry<R>,
     vtype: &str,
@@ -119,9 +179,7 @@ fn entry_to_variant<R: std::io::Read>(
     let n = std::io::copy(&mut entry, &mut buf)?;
     assert_eq!(n as usize, size);
     let v = glib::Bytes::from_owned(buf);
-    Ok(crate::variant_utils::variant_new_from_bytes(
-        vtype, v, false,
-    ))
+    Ok(crate::variant_utils::variant_normal_from_bytes(vtype, v))
 }
 
 impl<'a> Importer<'a> {
@@ -130,24 +188,66 @@ impl<'a> Importer<'a> {
         entry: tar::Entry<R>,
         checksum: &str,
     ) -> Result<()> {
-        let v = entry_to_variant(entry, "(a{sv}aya(say)sstayay)", checksum)?;
-        // FIXME insert expected dirtree/dirmeta
-        let _ = self.repo.write_metadata(
-            ostree::ObjectType::Commit,
-            Some(checksum),
-            &v,
-            gio::NONE_CANCELLABLE,
-        )?;
+        assert_eq!(self.state, ImportState::Initial);
+        self.import_metadata(entry, checksum, ostree::ObjectType::Commit)?;
         self.state = ImportState::Importing(checksum.to_string());
         Ok(())
     }
 
-    fn import_content_object<R: std::io::Read>(
+    fn import_metadata<R: std::io::Read>(
         &mut self,
-        _entry: tar::Entry<R>,
-        _checksum: &str,
-        _objtype: &str,
+        entry: tar::Entry<R>,
+        checksum: &str,
+        objtype: ostree::ObjectType,
     ) -> Result<()> {
+        let vtype =
+            format_for_objtype(objtype).ok_or_else(|| anyhow!("Unhandled objtype {}", objtype))?;
+        let v = entry_to_variant(entry, vtype, checksum)?;
+        // FIXME insert expected dirtree/dirmeta
+        let _ = self
+            .repo
+            .write_metadata(objtype, Some(checksum), &v, gio::NONE_CANCELLABLE)?;
+        Ok(())
+    }
+
+    #[context("Processing content object {}", checksum)]
+    fn import_content_object<R: std::io::Read>(
+        &self,
+        mut entry: tar::Entry<R>,
+        checksum: &str,
+        xattrs: Option<&glib::Variant>,
+    ) -> Result<()> {
+        let cancellable = gio::NONE_CANCELLABLE;
+        let (recv, mut send) = os_pipe::pipe()?;
+        let size = entry.header().size()?;
+        let header_copy = entry.header().clone();
+        let repo_clone = self.repo.clone();
+        crossbeam::thread::scope(move |s| -> Result<()> {
+            let j = s.spawn(move |_| -> Result<()> {
+                let i = header_to_gfileinfo(&header_copy)?;
+                let recv = gio::ReadInputStream::new(recv);
+                let (ostream, size) =
+                    ostree::raw_file_to_content_stream(&recv, &i, xattrs, cancellable)?;
+                repo_clone.write_content(Some(checksum), &ostream, size, cancellable)?;
+                Ok(())
+            });
+            let mut buf = [0u8; 8192];
+            let mut total = 0u64;
+            loop {
+                let n = entry.read(&mut buf)?;
+                if n == 0 {
+                    drop(send);
+                    break;
+                }
+                send.write_all(&buf[0..n])?;
+                total += n as u64;
+            }
+            assert_eq!(total, size);
+            j.join().unwrap()?;
+            Ok(())
+        })
+        .unwrap()?;
+
         Ok(())
     }
 
@@ -195,7 +295,7 @@ impl<'a> Importer<'a> {
         }
         let checksum = format!("{}{}", parentname, checksum_rest);
         validate_sha256(&checksum)?;
-        if let Some((xattr_target, xattr_obj)) = xattrs.as_ref() {
+        let xattr_ref = if let Some((xattr_target, xattr_objref)) = xattrs {
             if xattr_target.as_str() != checksum.as_str() {
                 return Err(anyhow!(
                     "Found object {} but previous xattr was {}",
@@ -203,19 +303,33 @@ impl<'a> Importer<'a> {
                     xattr_target
                 ));
             }
-        }
-        let objtype = &objtype.to_string();
-        dbg!(&checksum, objtype);
-        match (objtype.as_str(), is_xattrs, &self.state) {
-            ("commit", _, ImportState::Initial) => self.import_commit(entry, &checksum),
-            ("file", true, ImportState::Importing(_)) => self.import_xattr_ref(entry, checksum),
+            let v = self
+                .xattrs
+                .get(&xattr_objref)
+                .ok_or_else(|| anyhow!("Failed to find xattr {}", xattr_objref))?;
+            Some(v)
+        } else {
+            None
+        };
+        let objtype = objtype_from_string(&objtype)
+            .ok_or_else(|| anyhow!("Invalid object type {}", objtype))?;
+        match (objtype, is_xattrs, &self.state) {
+            (ostree::ObjectType::Commit, _, ImportState::Initial) => {
+                self.import_commit(entry, &checksum)
+            }
+            (ostree::ObjectType::File, true, ImportState::Importing(_)) => {
+                self.import_xattr_ref(entry, checksum)
+            }
+            (ostree::ObjectType::File, false, ImportState::Importing(_)) => {
+                self.import_content_object(entry, &checksum, xattr_ref)
+            }
             (objtype, false, ImportState::Importing(_)) => {
-                self.import_content_object(entry, &checksum, objtype)
+                self.import_metadata(entry, &checksum, objtype)
             }
             (o, _, ImportState::Initial) => {
                 return Err(anyhow!("Found content object {} before commit", o))
             }
-            ("commit", _, ImportState::Importing(c)) => {
+            (ostree::ObjectType::Commit, _, ImportState::Importing(c)) => {
                 return Err(anyhow!("Found multiple commit objects; original: {}", c))
             }
             (objtype, true, _) => {
@@ -245,23 +359,25 @@ impl<'a> Importer<'a> {
             .ok_or_else(|| anyhow!("Invalid xattr link {}", target))?;
         validate_sha256(xattr_target)?;
         self.next_xattrs = Some((target, xattr_target.to_string()));
-        dbg!(&self.next_xattrs);
         Ok(())
     }
 
-    fn import_xattrs<'b, R: std::io::Read>(&mut self, entry: tar::Entry<'b, R>) -> Result<()> {
+    fn import_xattrs<'b, R: std::io::Read>(&mut self, mut entry: tar::Entry<'b, R>) -> Result<()> {
         match &self.state {
             ImportState::Initial => return Err(anyhow!("Found xattr object {} before commit")),
             ImportState::Importing(_) => {}
         }
-        let path = entry.path()?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| anyhow!("Invalid xattr dir: {:?}", path))?;
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid non-UTF8 xattr name: {:?}", name))?;
-        validate_sha256(name)?;
+        let checksum = {
+            let path = entry.path()?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| anyhow!("Invalid xattr dir: {:?}", path))?;
+            let name = name
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid non-UTF8 xattr name: {:?}", name))?;
+            validate_sha256(name)?;
+            name.to_string()
+        };
         let header = entry.header();
         if header.entry_type() != tar::EntryType::Regular {
             return Err(anyhow!(
@@ -269,7 +385,18 @@ impl<'a> Importer<'a> {
                 header.entry_type()
             ));
         }
-        // TODO
+        let n = header.size()?;
+        if n > MAX_XATTR_SIZE as u64 {
+            return Err(anyhow!("Invalid xattr size {}", n));
+        }
+
+        let mut contents = Vec::with_capacity(n as usize);
+        let c = std::io::copy(&mut entry, &mut contents)?;
+        assert_eq!(c, n);
+        let contents: glib::Bytes = contents.as_slice().into();
+        let contents = variant_new_from_bytes(OSTREE_XATTRS_FORMAT, contents, false);
+
+        self.xattrs.insert(checksum, contents);
         Ok(())
     }
 

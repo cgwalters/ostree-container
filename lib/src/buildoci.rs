@@ -129,7 +129,9 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         let mut h = tar::Header::new_gnu();
         h.set_uid(meta.get_attribute_uint32("unix::uid") as u64);
         h.set_gid(meta.get_attribute_uint32("unix::gid") as u64);
-        h.set_mode(meta.get_attribute_uint32("unix::mode"));
+        let mode = meta.get_attribute_uint32("unix::mode");
+        dbg!(mode);
+        h.set_mode(mode);
         let mut target_header = h.clone();
         target_header.set_size(0);
 
@@ -169,7 +171,7 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         cancellable: Option<&C>,
     ) -> Result<()> {
         let v = &repo.load_variant(ostree::ObjectType::DirTree, checksum)?;
-        self.append(ostree::ObjectType::DirMeta, checksum, v)?;
+        self.append(ostree::ObjectType::DirTree, checksum, v)?;
         let v = v.get_data_as_bytes();
         let v = v.try_as_aligned()?;
         let v = gv!("(a(say)a(sayay))").cast(v);
