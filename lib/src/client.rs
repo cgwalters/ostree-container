@@ -39,7 +39,7 @@ async fn fetch_layer_descriptor(
     }
 }
 
-async fn import_impl(repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
+async fn import_impl(_repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
     let image_ref: oci_distribution::Reference = image_ref.parse()?;
     let client = &mut oci_distribution::Client::default();
     let auth = &oci_distribution::secrets::RegistryAuth::Anonymous;

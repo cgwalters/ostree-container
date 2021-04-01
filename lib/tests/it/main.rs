@@ -2,28 +2,14 @@ use anyhow::Result;
 use camino::Utf8Path;
 use indoc::indoc;
 use sh_inline::bash;
-use structopt::StructOpt;
 
 const EXAMPLEOS_TAR: &[u8] = include_bytes!("fixtures/exampleos.tar.zst");
 const TESTREF: &str = "exampleos/x86_64/stable";
 const CONTENT_CHECKSUM: &str = "0ef7461f9db15e1d8bd8921abf20694225fbaa4462cadf7deed8ea0e43162120";
 
-#[derive(Debug, StructOpt)]
-struct GenerateOpts {
-    #[structopt(long)]
-    dir: String,
-}
-
-#[derive(Debug, StructOpt)]
-#[structopt(name = "ostree-container-test-e2e")]
-#[structopt(rename_all = "kebab-case")]
-enum Opt {
-    GenerateOci(GenerateOpts),
-}
-
-fn generate(opts: &GenerateOpts) -> Result<()> {
+fn generate_test_oci(dir: &Utf8Path) -> Result<()> {
     let cancellable = gio::NONE_CANCELLABLE;
-    let path = Utf8Path::new(&opts.dir);
+    let path = Utf8Path::new(dir);
     let tarpath = &path.join("exampleos.tar.zst");
     std::fs::write(tarpath, EXAMPLEOS_TAR)?;
     bash!(
@@ -50,20 +36,13 @@ fn generate(opts: &GenerateOpts) -> Result<()> {
     let ocipath = &path.join("exampleos-oci");
     let ocitarget = ostree_container::buildoci::Target::OciDir(ocipath.as_ref());
     ostree_container::buildoci::build(repo, TESTREF, ocitarget)?;
-    bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
+    //bash!(r"skopeo inspect oci:{ocipath}", ocipath = ocipath.as_str())?;
     Ok(())
 }
 
-fn run() -> Result<()> {
-    match Opt::from_args() {
-        Opt::GenerateOci(ref args) => generate(args),
-    }
-}
-
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {:#}", e);
-        std::process::exit(1);
-    }
+#[test]
+fn test_oci() -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let path = Utf8Path::from_path(tempdir.path()).unwrap();
+    generate_test_oci(path)
 }

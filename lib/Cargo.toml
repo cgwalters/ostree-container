@@ -34,8 +34,8 @@ futures = "0.3.13"
 
 [dev-dependencies]
 tempfile = "3.2.0"
-indoc = "1.0.3"
-sh-inline = "0.1.0"
 clap = "2.33.3"
 structopt = "0.3.21"
 tokio = { version = "1", features = ["full"] }
+indoc = "1.0.3"
+sh-inline = "0.1.0"
