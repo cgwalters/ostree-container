@@ -1,6 +1,8 @@
 //! APIs for extracting OSTree commits from container images
 
-use std::{collections::HashMap, rc::Rc};
+use std::collections::HashMap;
+
+use crate::variant_utils::variant_new_from_bytes;
 
 use super::Result;
 use anyhow::anyhow;
@@ -14,6 +16,7 @@ const MAX_XATTR_SIZE: u32 = 1024 * 1024;
 const OSTREE_COMMIT_FORMAT: &str = "(a{sv}aya(say)sstayay)";
 const OSTREE_DIRTREE_FORMAT: &str = "(a(say)a(sayay))";
 const OSTREE_DIRMETA_FORMAT: &str = "(uuua(ayay))";
+const OSTREE_XATTRS_FORMAT: &str = "a(ayay)";
 
 /// The result of an imported container with an embedded ostree.
 #[derive(Debug)]
@@ -88,7 +91,7 @@ enum ImportState {
 struct Importer<'a> {
     state: ImportState,
     repo: &'a ostree::Repo,
-    xattrs: HashMap<String, Rc<[u8]>>,
+    xattrs: HashMap<String, glib::Variant>,
     next_xattrs: Option<(String, String)>,
 }
 
@@ -143,7 +146,7 @@ fn format_for_objtype(t: ostree::ObjectType) -> Option<&'static str> {
         ostree::ObjectType::DirTree => Some(OSTREE_DIRTREE_FORMAT),
         ostree::ObjectType::DirMeta => Some(OSTREE_DIRMETA_FORMAT),
         ostree::ObjectType::Commit => Some(OSTREE_COMMIT_FORMAT),
-        o => None,
+        _ => None,
     }
 }
 
@@ -153,7 +156,7 @@ fn objtype_from_string(t: &str) -> Option<ostree::ObjectType> {
         "dirtree" => ostree::ObjectType::DirTree,
         "dirmeta" => ostree::ObjectType::DirMeta,
         "file" => ostree::ObjectType::File,
-        o => return None,
+        _ => return None,
     })
 }
 
@@ -181,7 +184,7 @@ impl<'a> Importer<'a> {
         checksum: &str,
     ) -> Result<()> {
         assert_eq!(self.state, ImportState::Initial);
-        self.import_metadata(entry, checksum, "commit")?;
+        self.import_metadata(entry, checksum, ostree::ObjectType::Commit)?;
         self.state = ImportState::Importing(checksum.to_string());
         Ok(())
     }
@@ -190,10 +193,8 @@ impl<'a> Importer<'a> {
         &mut self,
         entry: tar::Entry<R>,
         checksum: &str,
-        objtype: &str,
+        objtype: ostree::ObjectType,
     ) -> Result<()> {
-        let objtype = objtype_from_string(objtype)
-            .ok_or_else(|| anyhow!("Invalid object type: {}", objtype))?;
         let vtype =
             format_for_objtype(objtype).ok_or_else(|| anyhow!("Unhandled objtype {}", objtype))?;
         let v = entry_to_variant(entry, vtype, checksum)?;
@@ -204,14 +205,16 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    #[context("Processing content object {}", checksum)]
     fn import_content_object<R: std::io::Read>(
-        &mut self,
+        &self,
         entry: tar::Entry<R>,
         checksum: &str,
-        xattrs: Option<Rc<[u8]>>,
-        objtype: &str,
+        xattrs: Option<&glib::Variant>,
     ) -> Result<()> {
         let size = entry.size();
+        let i = header_to_gfileinfo(entry.header())?;
+        //let entry = gio::ReadInputStream::new(entry);
         Ok(())
     }
 
@@ -267,27 +270,34 @@ impl<'a> Importer<'a> {
                     xattr_target
                 ));
             }
-            let v = Rc::clone(
-                self.xattrs
-                    .get(&xattr_objref)
-                    .ok_or_else(|| anyhow!("Failed to find xattr {}", xattr_objref))?,
-            );
+            let v = self
+                .xattrs
+                .get(&xattr_objref)
+                .ok_or_else(|| anyhow!("Failed to find xattr {}", xattr_objref))?;
             Some(v)
         } else {
             None
         };
-        let objtype = &objtype.to_string();
+        let objtype = objtype_from_string(&objtype)
+            .ok_or_else(|| anyhow!("Invalid object type {}", objtype))?;
         dbg!(&checksum, objtype);
-        match (objtype.as_str(), is_xattrs, &self.state) {
-            ("commit", _, ImportState::Initial) => self.import_commit(entry, &checksum),
-            ("file", true, ImportState::Importing(_)) => self.import_xattr_ref(entry, checksum),
+        match (objtype, is_xattrs, &self.state) {
+            (ostree::ObjectType::Commit, _, ImportState::Initial) => {
+                self.import_commit(entry, &checksum)
+            }
+            (ostree::ObjectType::File, true, ImportState::Importing(_)) => {
+                self.import_xattr_ref(entry, checksum)
+            }
+            (ostree::ObjectType::File, false, ImportState::Importing(_)) => {
+                self.import_content_object(entry, &checksum, xattr_ref)
+            }
             (objtype, false, ImportState::Importing(_)) => {
-                self.import_content_object(entry, &checksum, xattr_ref, objtype)
+                self.import_metadata(entry, &checksum, objtype)
             }
             (o, _, ImportState::Initial) => {
                 return Err(anyhow!("Found content object {} before commit", o))
             }
-            ("commit", _, ImportState::Importing(c)) => {
+            (ostree::ObjectType::Commit, _, ImportState::Importing(c)) => {
                 return Err(anyhow!("Found multiple commit objects; original: {}", c))
             }
             (objtype, true, _) => {
@@ -352,8 +362,10 @@ impl<'a> Importer<'a> {
         let mut contents = Vec::with_capacity(n as usize);
         let c = std::io::copy(&mut entry, &mut contents)?;
         assert_eq!(c, n);
-        self.xattrs
-            .insert(checksum, contents.into_boxed_slice().into());
+        let contents: glib::Bytes = contents.as_slice().into();
+        let contents = variant_new_from_bytes(OSTREE_XATTRS_FORMAT, contents, false);
+
+        self.xattrs.insert(checksum, contents);
         Ok(())
     }
 
