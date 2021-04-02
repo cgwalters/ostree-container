@@ -119,6 +119,8 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         Ok(Some((path, h)))
     }
 
+    /// Write a content object, returning the path/header that should be used
+    /// as a hard link to it in the target path.  This matches how ostree checkouts work.
     fn append_content(&mut self, checksum: &str) -> Result<(Utf8PathBuf, tar::Header)> {
         let path = object_path(ostree::ObjectType::File, checksum);
 
@@ -162,6 +164,7 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         Ok((path, target_header))
     }
 
+    /// Write a dirtree object.
     fn append_dirtree<C: IsA<gio::Cancellable>>(
         &mut self,
         dirpath: &Utf8Path,
@@ -217,8 +220,10 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
     }
 }
 
-/// Recursively walk an OSTree commit, injecting all of its metadata
-/// into the
+/// Recursively walk an OSTree commit and generate data into a `[tar::Builder]`
+/// which contains all of the metadata objects, as well as a hardlinked
+/// stream that looks like a checkout.  Extended attributes are stored specially out
+/// of band of tar so that they can be reliably retrieved.
 fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     repo: &ostree::Repo,
     commit_checksum: &str,
@@ -278,7 +283,7 @@ fn ostree_metadata_to_tar<W: std::io::Write, C: IsA<gio::Cancellable>>(
     Ok(())
 }
 
-/// Write an ostree directory as an OCI blob
+/// Write an ostree commit to an OCI blob
 #[context("Writing ostree root to blob")]
 fn export_ostree_ref_to_blobdir(
     repo: &ostree::Repo,

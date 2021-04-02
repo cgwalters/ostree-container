@@ -14,15 +14,28 @@ These generated containers should work in 3 distinct ways:
 
 ```
 .
-├── etc
-├── ostree
-│   ├── object-map      # (database allowing mapping e.g. /usr/bin/bash to an ostree checksum)
-│   └── repo            # An archive mode repo that may contain e.g. static deltas
-│   └── repo-webserver  # A binary usable as an entrypoint to dynamically serve an archive mode repo as well as deltas
+├── etc                # content is at traditional /etc, not /usr/etc
+│   └── passwd
+├── sysroot       
+│   └── ostree         # ostree object store with hardlinks to destinations
+│       ├── repo
+│       │   └── objects
+│       │       ├── 00
+│       │       └── 8b
+│       │           └── 7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52.file.xattrs
+│       │           └── 7df143d91c716ecfa5fc1730022f6b421b05cedee8fd52b1fc65a96030ad52.file
+│       └── xattrs    # A new directory with extended attributes, hardlinked with .xattr files
+│           └── 58d523efd29244331392770befa2f8bd55b3ef594532d3b8dbf94b70dc72e674
 └── usr
     ├── bin
+    │   └── bash
     └── lib64
+        └── libc.so
 ```
+
+Think of this like a new ostree repository mode `tar-stream` or so, although right now it only holds a single commit.
+
+A major distinction is the addition of special `.xattr` files; tar variants and support library differ too much for us to rely on this making it through round trips.  And further, to support the webserver-in-container we need e.g. `security.selinux` to not be changed/overwritten by the container runtime.
 
 ## Bundle an OSTree repository into a container
 

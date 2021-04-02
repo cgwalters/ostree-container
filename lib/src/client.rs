@@ -9,8 +9,16 @@ use std::collections::HashMap;
 
 use oci_distribution::manifest::OciDescriptor;
 
+/// Arbitrary limit on xattrs to avoid RAM exhaustion attacks. The actual filesystem limits are often much smaller.
+/// See https://en.wikipedia.org/wiki/Extended_file_attributes
+/// For example, XFS limits to 614 KiB.
 const MAX_XATTR_SIZE: u32 = 1024 * 1024;
+/// Limit on metadata objects (dirtree/dirmeta); this is copied
+/// from ostree-core.h.  TODO: Bind this in introspection
+const MAX_METADATA_SIZE: u32 = 10 * 1024 * 1024;
 
+// Variant formats, see ostree-core.h
+// TODO - expose these via introspection
 const OSTREE_COMMIT_FORMAT: &str = "(a{sv}aya(say)sstayay)";
 const OSTREE_DIRTREE_FORMAT: &str = "(a(say)a(sayay))";
 const OSTREE_DIRMETA_FORMAT: &str = "(uuua(ayay))";
@@ -80,12 +88,15 @@ pub async fn import<I: AsRef<str>>(repo: &ostree::Repo, image_ref: I) -> Result<
     Ok(import_impl(repo, image_ref.as_ref()).await?)
 }
 
+/// State tracker for the importer.  The main goal is to reject multiple
+/// commit objects, as well as finding metadata/content before the commit.
 #[derive(Debug, PartialEq, Eq)]
 enum ImportState {
     Initial,
     Importing(String),
 }
 
+/// Importer machine.
 struct Importer<'a> {
     state: ImportState,
     repo: &'a ostree::Repo,
@@ -99,12 +110,13 @@ impl<'a> Drop for Importer<'a> {
     }
 }
 
+/// Validate size/type of a tar header for OSTree metadata object.
 fn validate_metadata_header(header: &tar::Header, desc: &str) -> Result<usize> {
     if header.entry_type() != tar::EntryType::Regular {
         return Err(anyhow!("Invalid non-regular metadata object {}", desc));
     }
     let size = header.size()?;
-    let max_size = 10u64 * 1024 * 1024;
+    let max_size = MAX_METADATA_SIZE as u64;
     if size > max_size {
         return Err(anyhow!(
             "object of size {} exceeds {} bytes",
@@ -115,6 +127,8 @@ fn validate_metadata_header(header: &tar::Header, desc: &str) -> Result<usize> {
     Ok(size as usize)
 }
 
+/// Convert a tar header to a gio::FileInfo.  This only maps
+/// attributes that matter to ostree.
 fn header_to_gfileinfo(header: &tar::Header) -> Result<gio::FileInfo> {
     let i = gio::FileInfo::new();
     let t = match header.entry_type() {
@@ -155,6 +169,8 @@ fn format_for_objtype(t: ostree::ObjectType) -> Option<&'static str> {
     }
 }
 
+/// The C function ostree_object_type_from_string aborts on
+/// unknown strings, so we have a safe version here.
 fn objtype_from_string(t: &str) -> Option<ostree::ObjectType> {
     Some(match t {
         "commit" => ostree::ObjectType::Commit,
@@ -165,6 +181,7 @@ fn objtype_from_string(t: &str) -> Option<ostree::ObjectType> {
     })
 }
 
+/// Given a tar entry, read it all into a GVariant
 fn entry_to_variant<R: std::io::Read>(
     mut entry: tar::Entry<R>,
     vtype: &str,
@@ -181,6 +198,7 @@ fn entry_to_variant<R: std::io::Read>(
 }
 
 impl<'a> Importer<'a> {
+    /// Import a commit object.  Must be in "initial" state.  This transitions into the "importing" state.
     fn import_commit<R: std::io::Read>(
         &mut self,
         entry: tar::Entry<R>,
@@ -192,6 +210,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// Import a metadata object.
     fn import_metadata<R: std::io::Read>(
         &mut self,
         entry: tar::Entry<R>,
@@ -208,6 +227,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// Import a content object.
     #[context("Processing content object {}", checksum)]
     fn import_content_object<R: std::io::Read>(
         &self,
@@ -240,6 +260,8 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// Given a tar entry that looks like an object (its path is under ostree/repo/objects/),
+    /// determine its type and import it.
     #[context("Importing object {}", path)]
     fn import_object<'b, R: std::io::Read>(
         &mut self,
@@ -327,6 +349,8 @@ impl<'a> Importer<'a> {
         }
     }
 
+    /// Handle <checksum>.xattr hardlinks that contain extended attributes for
+    /// a content object.
     #[context("Processing xattr ref")]
     fn import_xattr_ref<'b, R: std::io::Read>(
         &mut self,
@@ -351,6 +375,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// Process a special /xattrs/ entry (sha256 of xattr values).
     fn import_xattrs<'b, R: std::io::Read>(&mut self, mut entry: tar::Entry<'b, R>) -> Result<()> {
         match &self.state {
             ImportState::Initial => return Err(anyhow!("Found xattr object {} before commit")),
@@ -389,6 +414,7 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// Consume this importer and return the imported OSTree commit checksum.
     fn commit(mut self) -> Result<String> {
         self.repo.commit_transaction(gio::NONE_CANCELLABLE)?;
         match std::mem::replace(&mut self.state, ImportState::Initial) {
@@ -408,7 +434,7 @@ fn validate_sha256(s: &str) -> Result<()> {
     Ok(())
 }
 
-/// Import a tarball
+/// Read the contents of a tarball and import the ostree commit inside.  The sha56 of the imported commit will be returned.
 #[context("Importing")]
 pub fn import_tarball(repo: &ostree::Repo, src: impl std::io::Read) -> Result<String> {
     let mut importer = Importer {
