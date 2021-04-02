@@ -6,8 +6,6 @@ use anyhow::anyhow;
 use camino::Utf8Path;
 use fn_error_context::context;
 use std::collections::HashMap;
-use std::io::prelude::*;
-use std::io::Read;
 
 use oci_distribution::manifest::OciDescriptor;
 
@@ -231,18 +229,9 @@ impl<'a> Importer<'a> {
                 repo_clone.write_content(Some(checksum), &ostream, size, cancellable)?;
                 Ok(())
             });
-            let mut buf = [0u8; 8192];
-            let mut total = 0u64;
-            loop {
-                let n = entry.read(&mut buf)?;
-                if n == 0 {
-                    drop(send);
-                    break;
-                }
-                send.write_all(&buf[0..n])?;
-                total += n as u64;
-            }
-            assert_eq!(total, size);
+            let n = std::io::copy(&mut entry, &mut send)?;
+            drop(send);
+            assert_eq!(n, size);
             j.join().unwrap()?;
             Ok(())
         })
