@@ -130,7 +130,6 @@ impl<'a, W: std::io::Write> OstreeMetadataWriter<'a, W> {
         h.set_uid(meta.get_attribute_uint32("unix::uid") as u64);
         h.set_gid(meta.get_attribute_uint32("unix::gid") as u64);
         let mode = meta.get_attribute_uint32("unix::mode");
-        dbg!(mode);
         h.set_mode(mode);
         let mut target_header = h.clone();
         target_header.set_size(0);
