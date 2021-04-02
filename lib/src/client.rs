@@ -1,13 +1,14 @@
 //! APIs for extracting OSTree commits from container images
 
-use std::collections::HashMap;
-
-use crate::variant_utils::variant_new_from_bytes;
-
 use super::Result;
+use crate::variant_utils::variant_new_from_bytes;
 use anyhow::anyhow;
 use camino::Utf8Path;
 use fn_error_context::context;
+use std::{io::prelude::*, sync::{Arc, Mutex}};
+use std::os::unix::io::FromRawFd;
+use glib::send_unique::SendUniqueCell;
+use std::{collections::HashMap, fs::File, io::Read};
 
 use oci_distribution::manifest::OciDescriptor;
 
@@ -88,14 +89,14 @@ enum ImportState {
     Importing(String),
 }
 
-struct Importer<'a> {
+struct Importer {
     state: ImportState,
-    repo: &'a ostree::Repo,
+    repo: SendUniqueCell<ostree::Repo>,
     xattrs: HashMap<String, glib::Variant>,
     next_xattrs: Option<(String, String)>,
 }
 
-impl<'a> Drop for Importer<'a> {
+impl Drop for Importer {
     fn drop(&mut self) {
         let _ = self.repo.abort_transaction(gio::NONE_CANCELLABLE);
     }
@@ -177,7 +178,7 @@ fn entry_to_variant<R: std::io::Read>(
     ))
 }
 
-impl<'a> Importer<'a> {
+impl Importer {
     fn import_commit<R: std::io::Read>(
         &mut self,
         entry: tar::Entry<R>,
@@ -199,21 +200,45 @@ impl<'a> Importer<'a> {
             format_for_objtype(objtype).ok_or_else(|| anyhow!("Unhandled objtype {}", objtype))?;
         let v = entry_to_variant(entry, vtype, checksum)?;
         // FIXME insert expected dirtree/dirmeta
-        let _ = self
-            .repo
+        let _ = self.repo
             .write_metadata(objtype, Some(checksum), &v, gio::NONE_CANCELLABLE)?;
         Ok(())
     }
 
+    #[allow(unsafe_code)]
     #[context("Processing content object {}", checksum)]
     fn import_content_object<R: std::io::Read>(
         &self,
-        entry: tar::Entry<R>,
+        mut entry: tar::Entry<R>,
         checksum: &str,
         xattrs: Option<&glib::Variant>,
     ) -> Result<()> {
+        let cancellable = gio::NONE_CANCELLABLE;
         let size = entry.size();
-        let i = header_to_gfileinfo(entry.header())?;
+        let (send, recv) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+        let mut send = unsafe { File::from_raw_fd(send) };
+        let mut recv = unsafe { File::from_raw_fd(recv) };
+        let header_copy = entry.header().clone();
+        crossbeam::thread::scope(move |s| -> Result<()> {
+            s.spawn(move |_| -> Result<()> {
+                let i = header_to_gfileinfo(&header_copy)?;
+                let recv = gio::ReadInputStream::new(recv);
+                let (ostream, size) = ostree::raw_file_to_content_stream(&recv, &i, xattrs, cancellable)?;
+                repo_copy.write_content(Some(checksum), &ostream, size, cancellable);
+                Ok(())
+            });
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = entry.read(&mut buf)?;
+                if n == 0 {
+                    drop(send);
+                    return Ok(());
+                }
+                send.write_all(&buf)?;
+            }
+        })
+        .unwrap()?;
+
         //let entry = gio::ReadInputStream::new(entry);
         Ok(())
     }
@@ -391,6 +416,9 @@ fn validate_sha256(s: &str) -> Result<()> {
 /// Import a tarball
 #[context("Importing")]
 pub fn import_tarball(repo: &ostree::Repo, src: impl std::io::Read) -> Result<String> {
+    let repo = ostree::Repo::new_for_path(format!("/proc/self/fd/{}", repo.get_dfd()));
+    repo.open(gio::NONE_CANCELLABLE)?;
+    let repo = SendUniqueCell::new(repo)?;
     let mut importer = Importer {
         state: ImportState::Initial,
         repo,

@@ -1,41 +1,52 @@
 [package]
-name = "ostree-container"
-version = "0.1.0"
 authors = ["Colin Walters <walters@verbum.org>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/cgwalters/ostree-container"
+name = "ostree-container"
 readme = "README.md"
-
+repository = "https://github.com/cgwalters/ostree-container"
+version = "0.1.0"
 [dependencies]
+anyhow = "1.0"
+camino = "1.0.4"
 cjson = "0.1.1"
+crossbeam = "0.8.0"
 flate2 = "1.0.20"
+fn-error-context = "0.1.1"
+futures = "0.3.13"
 gio = "0.9.1"
 glib = "0.10.3"
+glib-sys = "0.10.1"
+gvariant = "0.4.0"
 hex = "0.4.3"
+libc = "0.2.92"
+nix = "0.20.0"
+oci-distribution = "0.6.0"
 openat = "0.1.20"
 openat-ext = "0.1.13"
 openssl = "0.10.33"
 ostree = { version = "0.10.0", features = ["v2021_1"] }
-ostree-sys = "^0.7.2"
+ostree-sys = "0.7.2"
 phf = { version = "0.8.0", features = ["macros"] }
 serde = "1.0.125"
 serde_json = "1.0.64"
 tar = "0.4.33"
-anyhow = "1.0"
-fn-error-context = "0.1.1"
-nix = "0.20.0"
-camino = "1.0.4"
-glib-sys = "0.10.1"
-gvariant = "0.4.0"
-libc = "0.2.92"
-oci-distribution = "0.6.0"
-futures = "0.3.13"
+
+[dependencies.ostree]
+features = ["v2020_4"]
+version = "0.9.1"
+
+[dependencies.phf]
+features = ["macros"]
+version = "0.8.0"
 
 [dev-dependencies]
-tempfile = "3.2.0"
 clap = "2.33.3"
-structopt = "0.3.21"
-tokio = { version = "1", features = ["full"] }
 indoc = "1.0.3"
 sh-inline = "0.1.0"
+structopt = "0.3.21"
+tempfile = "3.2.0"
+
+[dev-dependencies.tokio]
+features = ["full"]
+version = "1"
