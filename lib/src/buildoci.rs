@@ -289,7 +289,7 @@ fn export_ostree_ref_to_blobdir(
     let mut w = oci::LayerWriter::new(ocidir)?;
     {
         let mut tar = tar::Builder::new(&mut w);
-        ostree_metadata_to_tar(repo, commit.as_str(), &mut tar, cancellable)?;
+        ostree_metadata_to_tar(repo, commit.unwrap().as_str(), &mut tar, cancellable)?;
         tar.finish()?;
     }
     w.complete()

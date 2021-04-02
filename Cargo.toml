@@ -7,3 +7,5 @@ lto = "thin"
 
 [patch.crates-io]
 oci-distribution = { git = 'https://github.com/cgwalters/krustlet', branch = 'streaming-client' }
+ostree = { path = '../../../gitlab/fkrull/ostree-rs' }
+ostree-sys = { path = '../../../gitlab/fkrull/ostree-rs/sys' }
