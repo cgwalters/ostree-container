@@ -16,5 +16,3 @@ pub mod buildoci;
 pub mod client;
 
 pub mod oci;
-mod ostree_ext;
-mod variant_utils;

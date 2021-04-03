@@ -25,15 +25,16 @@ oci-distribution = "0.6.0"
 openat = "0.1.20"
 openat-ext = "0.1.13"
 openssl = "0.10.33"
-os_pipe = "*"
+os_pipe = "0.9.2"
+tokio = { version = "1", features = ["full"] }
 ostree-sys = "0.7.2"
+ostree = { version = "0.10.0", features = ["v2021_1" ]}
+ostree-ext = { git = "https://github.com/cgwalters/ostree-ext", rev = "26cf018d058db08c3c2e32f86f69a4ad0fcb34c7" }
 serde = "1.0.125"
 serde_json = "1.0.64"
 tar = "0.4.33"
-
-[dependencies.ostree]
-features = ["v2021_1"]
-version = "0.10.0"
+futures-util = "0.3.13"
+tokio-pipe = "0.2.1"
 
 [dependencies.phf]
 features = ["macros"]

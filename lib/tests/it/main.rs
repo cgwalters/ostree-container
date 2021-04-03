@@ -1,10 +1,11 @@
-use std::{fs::File, io::BufReader};
-
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use flate2::read::GzDecoder;
 use fn_error_context::context;
 use indoc::indoc;
 use sh_inline::bash;
+use std::fs::File;
+use std::io::BufReader;
 
 use ostree_container::oci as myoci;
 
@@ -47,17 +48,17 @@ fn generate_test_oci(dir: &Utf8Path) -> Result<Utf8PathBuf> {
     Ok(ocipath)
 }
 
-fn read_blob(ocidir: &Utf8Path, digest: &str) -> Result<BufReader<File>> {
+fn read_blob(ocidir: &Utf8Path, digest: &str) -> Result<File> {
     let digest = digest
         .strip_prefix("sha256:")
         .ok_or_else(|| anyhow!("Unknown algorithim in digest {}", digest))?;
     let f = File::open(ocidir.join("blobs/sha256").join(digest))
         .with_context(|| format!("Opening blob {}", digest))?;
-    Ok(std::io::BufReader::new(f))
+    Ok(f)
 }
 
 #[context("Parsing OCI")]
-fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<BufReader<File>> {
+fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<GzDecoder<BufReader<File>>> {
     let f = std::io::BufReader::new(
         File::open(ocidir.join("index.json")).context("Opening index.json")?,
     );
@@ -78,7 +79,9 @@ fn find_layer_in_oci(ocidir: &Utf8Path) -> Result<BufReader<File>> {
             )
         })
         .ok_or_else(|| anyhow!("Failed to find rootfs layer"))?;
-    Ok(read_blob(ocidir, &layer.digest)?)
+    let blob = std::io::BufReader::new(read_blob(ocidir, &layer.digest)?);
+    let gz = flate2::read::GzDecoder::new(blob);
+    Ok(gz)
 }
 
 #[test]
@@ -97,7 +100,7 @@ fn test_e2e() -> Result<()> {
     destrepo.create(ostree::RepoMode::Archive, cancellable)?;
 
     let tarf = find_layer_in_oci(ocidir)?;
-    let imported_commit = ostree_container::client::import_tarball(&destrepo, tarf)?;
+    let imported_commit: String = ostree_ext::tar::import_tar(&destrepo, tarf)?;
     let (commitdata, _) = destrepo.load_commit(&imported_commit)?;
     assert_eq!(
         CONTENT_CHECKSUM,
