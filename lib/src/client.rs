@@ -3,7 +3,10 @@
 use super::Result;
 use anyhow::anyhow;
 use fn_error_context::context;
+use futures_util::stream::StreamExt;
 use oci_distribution::manifest::OciDescriptor;
+use std::os::unix::io::{FromRawFd, IntoRawFd};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug)]
 pub struct Import {
@@ -39,8 +42,9 @@ async fn fetch_layer_descriptor(
     }
 }
 
+#[allow(unsafe_code)]
 #[context("Importing {}", image_ref)]
-async fn import_impl(_repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
+async fn import_impl(repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
     let image_ref: oci_distribution::Reference = image_ref.parse()?;
     let client = &mut oci_distribution::Client::default();
     let auth = &oci_distribution::secrets::RegistryAuth::Anonymous;
@@ -52,13 +56,28 @@ async fn import_impl(_repo: &ostree::Repo, image_ref: &str) -> Result<Import> {
         )
         .await?;
     let (image_digest, layer) = fetch_layer_descriptor(client, &image_ref).await?;
-    let mut out: Vec<u8> = Vec::new();
-    client
-        .pull_layer(&image_ref, &layer.digest, &mut out)
-        .await?;
+
+    let mut req = client
+        .request_layer(&image_ref, &layer.digest)
+        .await?
+        .bytes_stream();
+    // FIXME better way to bridge async -> sync?
+    let (piperead, mut pipewrite) = tokio_pipe::pipe()?;
+    let piperead = unsafe { std::fs::File::from_raw_fd(piperead.into_raw_fd()) };
+    let copyin_task = tokio::spawn(async move {
+        while let Some(buf) = req.next().await {
+            let buf = buf?;
+            pipewrite.write_all(&buf).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let repo = repo.clone();
+    let res = tokio::task::spawn_blocking(move || ostree_ext::tar::import_tar(&repo, piperead));
+    copyin_task.await??;
+    let ostree_commit = res.await??;
 
     Ok(Import {
-        ostree_commit: "none".to_string(),
+        ostree_commit,
         image_digest,
     })
 }
